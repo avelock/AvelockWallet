@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tact-lang/tact/main/src/config/configSchema.json",
+  "projects": [
+    {
+      "name": "AvelockWallet",
+      "path": "contracts/avelock_wallet.tact",
+      "output": "build/AvelockWallet",
+      "options": {
+        "debug": false,
+        "external": false
+      },
+      "mode": "full"
+    },
+    {
+      "name": "AvelockSecurityExtension",
+      "path": "contracts/avelock_security_extension.tact",
+      "output": "build/AvelockSecurityExtension",
+      "options": {
+        "debug": false,
+        "external": false
+      },
+      "mode": "full"
+    },
+    {
+      "name": "MockJettonWallet",
+      "path": "contracts/mocks/mock_jetton_wallet.tact",
+      "output": "build/MockJettonWallet",
+      "options": {
+        "debug": false,
+        "external": false
+      },
+      "mode": "full"
+    }
+  ]
+}
