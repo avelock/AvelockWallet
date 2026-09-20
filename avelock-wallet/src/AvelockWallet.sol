@@ -17,10 +17,10 @@ import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 /// @dev Install the security module before depositing. No owner execution or upgrade path.
 contract AvelockWallet is IERC721Receiver, IERC1155Receiver {
     function protocolVersion() external pure returns (uint256) {
-        return 3;
+        return 4;
     }
 
-    address public immutable owner;
+    address public owner;
     address public securityExtension;
 
     mapping(address => bool) public extensions;
@@ -28,31 +28,41 @@ contract AvelockWallet is IERC721Receiver, IERC1155Receiver {
     event Sent(address indexed to, uint256 value, bytes data);
     event Received(address indexed from, uint256 value);
     event ExtensionAdded(address indexed extension);
+    event OwnerRotated(address indexed previousOwner, address indexed newOwner);
 
     error VaultOnly();
     error AlreadyInitialized();
-    error InvalidExtension();
-    error NotOwner();
     error NotExtension();
     error CallFailed(bytes returndata);
     error ZeroAddress();
-
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
 
     modifier onlyExtension() {
         if (!extensions[msg.sender]) revert NotExtension();
         _;
     }
 
-    constructor(address _owner) {
+    /// @param _owner Initial owner key.
+    /// @param withdrawalDelay Initial withdrawal delay for the self-installed security module.
+    /// @param addressDelay Initial allowlist address-activation delay.
+    /// @param confirmationWindow Initial confirmation window after a withdrawal becomes available.
+    /// @param policyDelay Initial delay applied to future parameter/allowlist/owner changes.
+    /// @param minWithdrawalDelay Permanent floor for withdrawalDelay — see AvelockSecurityExtension.
+    /// @param minAddressDelay Permanent floor for addressDelay.
+    constructor(
+        address _owner,
+        uint256 withdrawalDelay,
+        uint256 addressDelay,
+        uint256 confirmationWindow,
+        uint256 policyDelay,
+        uint256 minWithdrawalDelay,
+        uint256 minAddressDelay
+    ) {
         if (_owner == address(0)) revert ZeroAddress();
         owner = _owner;
         // Only this exact implementation can ever acquire execution authority.
         address extension = address(new AvelockSecurityExtension(
-            address(this), 1 days, 7 days, 1 days, 7 days, 1 days, 1 days
+            address(this), withdrawalDelay, addressDelay, confirmationWindow, policyDelay,
+            minWithdrawalDelay, minAddressDelay
         ));
         securityExtension = extension;
         extensions[extension] = true;
@@ -111,6 +121,17 @@ contract AvelockWallet is IERC721Receiver, IERC1155Receiver {
         returns (bytes memory)
     {
         return _call(to, value, data);
+    }
+
+    /// @notice Only the permanently installed module may rotate the owner
+    ///         key, and only after its own policy delay — see
+    ///         AvelockSecurityExtension.proposeOwnerRotation. There is no
+    ///         faster path: a compromised key can be raced out, never
+    ///         instantly revoked (see threat-model on key compromise).
+    function rotateOwner(address newOwner) external onlyExtension {
+        if (newOwner == address(0)) revert ZeroAddress();
+        emit OwnerRotated(owner, newOwner);
+        owner = newOwner;
     }
 
     /// @notice No bootstrap window: protection is installed in the constructor.

@@ -12,6 +12,7 @@ import {IExtension} from "../interfaces/IExtension.sol";
 interface IAvelockWallet {
     function owner() external view returns (address);
     function executeFromExtension(address to, uint256 value, bytes calldata data) external returns (bytes memory);
+    function rotateOwner(address newOwner) external;
 }
 
 /// @title AvelockSecurityExtension
@@ -26,11 +27,15 @@ interface IAvelockWallet {
 ///      policy-delayed one — can ever go below (threat-model section 14).
 contract AvelockSecurityExtension is IExtension {
     function protocolVersion() external pure returns (uint256) {
-        return 3;
+        return 4;
     }
 
     uint256 public constant MAX_DELAY = 90 days;
     uint256 public constant MAX_CONFIRMATION_WINDOW = 30 days;
+    /// @dev How long a terminal request (cancelled or executed) is kept
+    ///      before it can be pruned — bounds unbounded storage growth
+    ///      from years of use without erasing recent history.
+    uint256 public constant REQUEST_RETENTION = 182 days;
 
     enum Param {
         WithdrawalDelay,
@@ -73,6 +78,14 @@ contract AvelockSecurityExtension is IExtension {
     /// @dev All parameter changes wait the current policy delay and obey fixed caps.
     mapping(Param => PendingParamChange) public pendingParamChanges;
 
+    /// @dev A delayed owner-key rotation, gated by the same policyDelay as
+    ///      any other change. There is no faster path: a compromised key
+    ///      can be raced out (by whoever notices and signs first), never
+    ///      instantly revoked — see threat-model on key compromise.
+    address public pendingOwner;
+    uint256 public pendingOwnerEffectiveAt;
+    bool public pendingOwnerExists;
+
     /// @dev 0 = never added; >0 = timestamp at which the address becomes
     ///      usable as a withdrawal destination.
     mapping(address => uint256) public allowlistActiveAt;
@@ -100,6 +113,10 @@ contract AvelockSecurityExtension is IExtension {
     event ParamChangeApplied(Param indexed param, uint256 newValue);
     event ParamChangeQueued(Param indexed param, uint256 newValue, uint256 effectiveAt);
     event ParamChangeCancelled(Param indexed param);
+    event OwnerRotationQueued(address indexed newOwner, uint256 effectiveAt);
+    event OwnerRotationApplied(address indexed newOwner);
+    event OwnerRotationCancelled(address indexed cancelledOwner);
+    event RequestPruned(uint256 indexed requestId);
 
     error InvalidParameter();
     error InvalidAsset();
@@ -189,6 +206,42 @@ contract AvelockSecurityExtension is IExtension {
         if (!pendingParamChanges[param].exists) revert NoPendingChange();
         delete pendingParamChanges[param];
         emit ParamChangeCancelled(param);
+    }
+
+    // ---------------------------------------------------------------
+    // Owner-key rotation — the only way to move off a key without
+    // instantly handing equal, permanent power to whoever holds it if
+    // it's stolen. Gated by the current policyDelay, same as any other
+    // change; a compromised key can still race a legitimate rotation
+    // (whoever signs first wins), it just can no longer act forever.
+    // ---------------------------------------------------------------
+
+    function proposeOwnerRotation(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
+        pendingOwner = newOwner;
+        pendingOwnerEffectiveAt = block.timestamp + policyDelay;
+        pendingOwnerExists = true;
+        emit OwnerRotationQueued(newOwner, pendingOwnerEffectiveAt);
+    }
+
+    function applyOwnerRotation() external onlyOwner {
+        if (!pendingOwnerExists) revert NoPendingChange();
+        if (block.timestamp < pendingOwnerEffectiveAt) revert ChangeNotReady();
+        address newOwner = pendingOwner;
+        pendingOwnerExists = false;
+        delete pendingOwner;
+        delete pendingOwnerEffectiveAt;
+        IAvelockWallet(walletAddress).rotateOwner(newOwner);
+        emit OwnerRotationApplied(newOwner);
+    }
+
+    function cancelOwnerRotation() external onlyOwner {
+        if (!pendingOwnerExists) revert NoPendingChange();
+        address cancelled = pendingOwner;
+        pendingOwnerExists = false;
+        delete pendingOwner;
+        delete pendingOwnerEffectiveAt;
+        emit OwnerRotationCancelled(cancelled);
     }
 
     function _validate(Param param, uint256 value) internal pure {
@@ -349,5 +402,28 @@ contract AvelockSecurityExtension is IExtension {
             bool success = abi.decode(returndata, (bool));
             if (!success) revert Erc20TransferFailed();
         }
+    }
+
+    /// @notice Remove a terminal request's storage once it has aged past
+    ///         the retention window. Without this, every successfully
+    ///         executed or cancelled request would accumulate in storage
+    ///         forever. IDs are never reused, so pruning never creates
+    ///         ambiguity with a future request.
+    function pruneRequest(uint256 requestId) external onlyOwner {
+        WithdrawalRequest storage r = requests[requestId];
+        if (r.to == address(0) && r.amount == 0 && r.availableAt == 0) revert RequestNotFound();
+        // A cancelled request never moved anything and may be removed
+        // immediately. An executed (settled) or expired-unconfirmed one
+        // waits out the retention window first, so a completed
+        // withdrawal's record stays available for audit for a while.
+        bool terminal = r.executed || r.cancelled || block.timestamp > r.expiresAt;
+        bool retentionOk = r.cancelled || block.timestamp > r.expiresAt + REQUEST_RETENTION;
+        if (!terminal || !retentionOk) revert RequestNotReady();
+
+        delete requests[requestId];
+        delete requestEpoch[requestId];
+        delete assetKind[requestId];
+        delete tokenId[requestId];
+        emit RequestPruned(requestId);
     }
 }

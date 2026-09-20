@@ -31,6 +31,15 @@ message WithdrawalFailed {
     requestId: Int as uint64;
 }
 
+// Sent to the wallet only by its own trusted module, only after the
+// module's policyDelay has elapsed on a proposed rotation — see
+// OP_PROPOSE_OWNER_ROTATION. There is no faster path: a compromised
+// owner key can be raced out via this same delayed path (by whoever
+// notices and signs first), never instantly revoked.
+message RotateOwner {
+    newOwnerPublicKey: Int as uint256;
+}
+
 struct WithdrawalRequest {
     to: Address;
     amount: Int as coins;
@@ -71,6 +80,10 @@ const OP_SET_POLICY_DELAY: Int = 8;
 const OP_APPLY_PARAM_CHANGE: Int = 9;
 const OP_CANCEL_PARAM_CHANGE: Int = 10;
 const OP_SET_CONFIRMATION_WINDOW: Int = 11;
+const OP_PRUNE_REQUEST: Int = 12;
+const OP_PROPOSE_OWNER_ROTATION: Int = 13;
+const OP_APPLY_OWNER_ROTATION: Int = 14;
+const OP_CANCEL_OWNER_ROTATION: Int = 15;
 
 const PARAM_WITHDRAWAL_DELAY: Int = 0;
 const PARAM_ADDRESS_DELAY: Int = 1;
@@ -91,6 +104,10 @@ const ASSET_NFT: Int = 2;
 
 const MAX_DELAY: Int = 7776000; // 90 days
 const MAX_CONFIRMATION_WINDOW: Int = 2592000; // 30 days
+// How long a terminal request record (cancelled, settled, or expired
+// unconfirmed) is kept before it can be pruned — bounds unbounded
+// storage growth from years of use without erasing recent history.
+const REQUEST_RETENTION: Int = 15724800; // 182 days
 
 contract AvelockSecurityExtension {
     seqno: Int as uint32;
@@ -118,6 +135,11 @@ contract AvelockSecurityExtension {
     requests: map<Int as uint64, WithdrawalRequest>;
     requestIdByOperation: map<Int as uint32, Int as uint64>;
     pendingParamChanges: map<Int as uint8, PendingParamChange>;
+
+    // A delayed owner-key rotation, gated by the same policyDelay as any
+    // other change. null = nothing pending.
+    pendingOwnerPublicKey: Int? = null;
+    pendingOwnerEffectiveAt: Int as uint32 = 0;
 
     init(
         ownerPublicKey: Int,
@@ -228,11 +250,18 @@ contract AvelockSecurityExtension {
             throwUnless(53, !req.submitted && !req.cancelled);
             req.cancelled = true;
             self.requests.set(requestId, req);
-        } else if (op == 12) {
-            // Only terminal, never-submitted records may be removed. IDs are never reused.
+        } else if (op == OP_PRUNE_REQUEST) {
+            // A cancelled request never moved anything and may be removed
+            // immediately. A settled (submitted) or expired-unconfirmed
+            // one waits out the retention window first, so a completed
+            // withdrawal's record stays available for audit for a while —
+            // otherwise successfully settled requests would accumulate in
+            // storage forever. IDs are never reused.
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
-            throwUnless(66, !req.submitted && (req.cancelled || now() > req.expiresAt + 604800));
+            let terminal: Bool = req.cancelled || req.submitted || now() > req.expiresAt;
+            let retentionOk: Bool = req.cancelled || now() > req.expiresAt + REQUEST_RETENTION;
+            throwUnless(66, terminal && retentionOk);
             let operation: Int? = self.requestOperation.get(requestId);
             if (operation != null) { self.requestIdByOperation.set(operation!!, null); }
             self.requestOperation.set(requestId, null);
@@ -347,6 +376,30 @@ contract AvelockSecurityExtension {
             let pending: PendingParamChange = self.pendingParamChanges.get(param)!!;
             throwUnless(58, pending.exists);
             self.pendingParamChanges.set(param, null);
+        } else if (op == OP_PROPOSE_OWNER_ROTATION) {
+            let newOwnerPublicKey: Int = msg.loadUint(256);
+            self.pendingOwnerPublicKey = newOwnerPublicKey;
+            self.pendingOwnerEffectiveAt = now() + self.policyDelay;
+        } else if (op == OP_APPLY_OWNER_ROTATION) {
+            throwUnless(58, self.pendingOwnerPublicKey != null);
+            throwUnless(59, now() >= self.pendingOwnerEffectiveAt);
+            let newOwnerPublicKey: Int = self.pendingOwnerPublicKey!!;
+            self.pendingOwnerPublicKey = null;
+            // This extension's OWN key is what actually authorizes future
+            // signed messages (see external() above) — rotating it here is
+            // what matters. The wallet's ownerPublicKey is only a display
+            // copy (it has no owner-checked entrypoint of its own), synced
+            // for consistency, not for authority.
+            self.ownerPublicKey = newOwnerPublicKey;
+            send(SendParameters{
+                to: self.walletAddress,
+                value: ton("0.02"),
+                mode: SendPayGasSeparately,
+                body: RotateOwner{ newOwnerPublicKey: newOwnerPublicKey }.toCell(),
+            });
+        } else if (op == OP_CANCEL_OWNER_ROTATION) {
+            throwUnless(58, self.pendingOwnerPublicKey != null);
+            self.pendingOwnerPublicKey = null;
         } else {
             throw(60);
         }
@@ -428,7 +481,7 @@ contract AvelockSecurityExtension {
 
     get fun ownerPublicKey(): Int { return self.ownerPublicKey; }
 
-    get fun protocolVersion(): Int { return 3; }
+    get fun protocolVersion(): Int { return 4; }
     get fun networkGlobalId(): Int { return self.networkGlobalId; }
     get fun operationalBalance(): Int { return myBalance(); }
     get fun minimumOperationalBalance(): Int { return ton("0.12"); }
@@ -475,5 +528,13 @@ contract AvelockSecurityExtension {
 
     get fun pendingParamChange(param: Int): PendingParamChange? {
         return self.pendingParamChanges.get(param);
+    }
+
+    get fun pendingOwnerPublicKey(): Int? {
+        return self.pendingOwnerPublicKey;
+    }
+
+    get fun pendingOwnerEffectiveAt(): Int {
+        return self.pendingOwnerEffectiveAt;
     }
 }
