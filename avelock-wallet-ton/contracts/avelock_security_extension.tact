@@ -1,3 +1,4 @@
+asm fun chainGlobalId(): Int { GLOBALID }
 // ============================================================
 // Avelock Wallet — Security Extension
 // Self-custody vault with on-chain withdrawal delays.
@@ -95,6 +96,8 @@ contract AvelockSecurityExtension {
     seqno: Int as uint32;
     lastOperationHash: Int as uint256 = 0;
     ownerPublicKey: Int as uint256;
+    networkGlobalId: Int as int32;
+    requestOperation: map<Int as uint64, Int as uint32>;
     walletAddress: Address;
 
     withdrawalDelay: Int as uint32;
@@ -118,6 +121,7 @@ contract AvelockSecurityExtension {
 
     init(
         ownerPublicKey: Int,
+        networkGlobalId: Int,
         walletAddress: Address,
         withdrawalDelay: Int,
         addressDelay: Int,
@@ -132,6 +136,8 @@ contract AvelockSecurityExtension {
         throwUnless(61, minWithdrawalDelay > 0 && minAddressDelay > 0);
         self.seqno = 0;
         self.ownerPublicKey = ownerPublicKey;
+        throwUnless(65, networkGlobalId == chainGlobalId());
+        self.networkGlobalId = networkGlobalId;
         self.walletAddress = walletAddress;
         self.withdrawalDelay = withdrawalDelay;
         self.addressDelay = addressDelay;
@@ -155,6 +161,7 @@ contract AvelockSecurityExtension {
         let operationHash: Int = msg.hash();
         throwUnless(35, checkSignature(operationHash, signature, self.ownerPublicKey));
         throwUnless(39, msg.loadAddress() == myAddress());
+        throwUnless(65, msg.loadInt(32) == self.networkGlobalId && self.networkGlobalId == chainGlobalId());
         throwUnless(36, msg.loadUint(32) == self.seqno);
         let validUntil: Int = msg.loadUint(32);
         throwUnless(37, validUntil > 0 && now() <= validUntil && validUntil <= now() + 3600);
@@ -213,6 +220,7 @@ contract AvelockSecurityExtension {
                 cancelled: false,
             });
             self.requestIdByOperation.set(self.seqno - 1, self.nextRequestId);
+            self.requestOperation.set(self.nextRequestId, self.seqno - 1);
             self.nextRequestId += 1;
         } else if (op == OP_CANCEL_WITHDRAWAL) {
             let requestId: Int = msg.loadUint(64);
@@ -220,7 +228,19 @@ contract AvelockSecurityExtension {
             throwUnless(53, !req.submitted && !req.cancelled);
             req.cancelled = true;
             self.requests.set(requestId, req);
+        } else if (op == 12) {
+            // Only terminal, never-submitted records may be removed. IDs are never reused.
+            let requestId: Int = msg.loadUint(64);
+            let req: WithdrawalRequest = self.requests.get(requestId)!!;
+            throwUnless(66, !req.submitted && (req.cancelled || now() > req.expiresAt + 604800));
+            let operation: Int? = self.requestOperation.get(requestId);
+            if (operation != null) { self.requestIdByOperation.set(operation!!, null); }
+            self.requestOperation.set(requestId, null);
+            self.requests.set(requestId, null);
+            self.requestEpoch.set(requestId, null);
+            self.requestAssetEpoch.set(requestId, null);
         } else if (op == OP_CONFIRM_WITHDRAWAL) {
+            throwUnless(64, myBalance() >= ton("0.12"));
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
             throwUnless(53, !req.submitted && !req.cancelled);
@@ -408,7 +428,10 @@ contract AvelockSecurityExtension {
 
     get fun ownerPublicKey(): Int { return self.ownerPublicKey; }
 
-    get fun protocolVersion(): Int { return 2; }
+    get fun protocolVersion(): Int { return 3; }
+    get fun networkGlobalId(): Int { return self.networkGlobalId; }
+    get fun operationalBalance(): Int { return myBalance(); }
+    get fun minimumOperationalBalance(): Int { return ton("0.12"); }
 
     get fun seqno(): Int {
         return self.seqno;

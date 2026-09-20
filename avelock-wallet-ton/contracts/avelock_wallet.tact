@@ -3,42 +3,29 @@
 // Self-custody vault with on-chain withdrawal delays.
 // https://github.com/avelock/AvelockWallet
 // ============================================================
-//
-// Protected TON vault. The signed owner entry point installs one permanent
-// security module; all asset movements must subsequently come from that module.
-// Complete and verify bootstrap before depositing assets.
 
-// Internal message sent by an authorized extension to move funds on the
-// wallet's behalf. `sender()` in the receiver below is the TON-enforced,
-// unspoofable source address of the internal message — the equivalent of
-// EVM's `msg.sender` check in `executeFromExtension`.
-message ExecuteFromExtension {
-    requestId: Int as uint64;
-    to: Address;
-    amount: Int as coins;
-    body: Cell?;
-}
-
-// Owner-signed external message op codes, parsed inside external().
-const OP_TRANSFER: Int = 1;
-const OP_ADD_EXTENSION: Int = 2;
-const OP_REMOVE_EXTENSION: Int = 3;
-
-message WithdrawalFailed {
-    requestId: Int as uint64;
-}
+import "./avelock_security_extension.tact";
 
 contract AvelockWallet {
     seqno: Int as uint32;
     ownerPublicKey: Int as uint256;
+    networkGlobalId: Int as int32;
     extensions: map<Address, Bool>;
     initialized: Bool = false;
     destinations: map<Int as uint64, Address>;
     module: Address?;
 
-    init(ownerPublicKey: Int) {
+    init(ownerPublicKey: Int, networkGlobalId: Int) {
         self.seqno = 0;
         self.ownerPublicKey = ownerPublicKey;
+        throwUnless(65, networkGlobalId == chainGlobalId());
+        self.networkGlobalId = networkGlobalId;
+        let trusted: Address = contractAddress(initOf AvelockSecurityExtension(
+            ownerPublicKey, networkGlobalId, myAddress(), 86400, 604800, 86400, 604800, 86400, 86400
+        ));
+        self.module = trusted;
+        self.extensions.set(trusted, true);
+        self.initialized = true;
     }
 
     // Accept plain TON transfers with no restriction — incoming funds are
@@ -47,26 +34,6 @@ contract AvelockWallet {
     // needs to exist and do nothing, since cashback()/reject would send
     // the deposit straight back to the sender instead of keeping it.
     receive() {}
-
-    // Domain-bound, expiring one-time bootstrap.
-    external(msg: Slice) {
-        let signature: Slice = msg.loadBits(512);
-        let payload: Slice = msg.loadRef().beginParse();
-        throwUnless(35, checkSignature(payload.hash(), signature, self.ownerPublicKey));
-        throwUnless(39, payload.loadAddress() == myAddress());
-        throwUnless(36, payload.loadUint(32) == self.seqno);
-        let validUntil: Int = payload.loadUint(32);
-        throwUnless(37, validUntil > 0 && now() <= validUntil && validUntil <= now() + 3600);
-        // Bootstrap only: no direct transfer, removal or replacement operation exists.
-        throwUnless(41, payload.loadUint(8) == OP_ADD_EXTENSION && !self.initialized);
-        let extension: Address = payload.loadAddress();
-        throwUnless(41, extension != myAddress());
-        acceptMessage();
-        self.seqno += 1;
-        self.extensions.set(extension, true);
-        self.initialized = true;
-        self.module = extension;
-    }
 
     // Only the installed security module may request a transfer.
     receive(msg: ExecuteFromExtension) {
@@ -92,7 +59,8 @@ contract AvelockWallet {
         });
     }
 
-    get fun protocolVersion(): Int { return 2; }
+    get fun protocolVersion(): Int { return 3; }
+    get fun networkGlobalId(): Int { return self.networkGlobalId; }
 
     get fun seqno(): Int {
         return self.seqno;
