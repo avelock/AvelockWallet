@@ -30,6 +30,16 @@
         "external": false
       },
       "mode": "full"
+    },
+    {
+      "name": "MockNftItem",
+      "path": "contracts/mocks/mock_nft_item.tact",
+      "output": "build/MockNftItem",
+      "options": {
+        "debug": false,
+        "external": false
+      },
+      "mode": "full"
     }
   ]
 }

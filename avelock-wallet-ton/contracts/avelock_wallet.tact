@@ -4,19 +4,16 @@
 // https://github.com/avelock/AvelockWallet
 // ============================================================
 //
-// AvelockWallet — TON port of the EVM AvelockWallet, same architecture as
-// TON Wallet V5R1: a single owner public key authorizes external messages
-// (signature + seqno replay protection), and an extension mechanism lets
-// an authorized contract move funds via an internal message without any
-// owner signature. This is the base wallet layer only — timelock,
-// allowlist and duress logic attach later as a separate extension
-// contract, exactly like the EVM version.
+// Protected TON vault. The signed owner entry point installs one permanent
+// security module; all asset movements must subsequently come from that module.
+// Complete and verify bootstrap before depositing assets.
 
 // Internal message sent by an authorized extension to move funds on the
 // wallet's behalf. `sender()` in the receiver below is the TON-enforced,
 // unspoofable source address of the internal message — the equivalent of
 // EVM's `msg.sender` check in `executeFromExtension`.
 message ExecuteFromExtension {
+    requestId: Int as uint64;
     to: Address;
     amount: Int as coins;
     body: Cell?;
@@ -27,10 +24,17 @@ const OP_TRANSFER: Int = 1;
 const OP_ADD_EXTENSION: Int = 2;
 const OP_REMOVE_EXTENSION: Int = 3;
 
+message WithdrawalFailed {
+    requestId: Int as uint64;
+}
+
 contract AvelockWallet {
     seqno: Int as uint32;
     ownerPublicKey: Int as uint256;
     extensions: map<Address, Bool>;
+    initialized: Bool = false;
+    destinations: map<Int as uint64, Address>;
+    module: Address?;
 
     init(ownerPublicKey: Int) {
         self.seqno = 0;
@@ -44,60 +48,51 @@ contract AvelockWallet {
     // the deposit straight back to the sender instead of keeping it.
     receive() {}
 
-    // Single owner-signed external entry point (TON equivalent of the EVM
-    // `execute()` path — offline-signed, relayable by anyone, authorized
-    // purely by the ed25519 signature over the message body). An op
-    // discriminant selects transfer vs. extension management, exactly
-    // like the wallet exposing execute()/addExtension()/removeExtension()
-    // as separate owner-only functions on EVM — here they all share one
-    // signature-checked entry because that's how TON external messages
-    // work.
+    // Domain-bound, expiring one-time bootstrap.
     external(msg: Slice) {
         let signature: Slice = msg.loadBits(512);
-        let signedHash: Int = msg.hash();
-        throwUnless(35, checkSignature(signedHash, signature, self.ownerPublicKey));
-
+        let payload: Slice = msg.loadRef().beginParse();
+        throwUnless(35, checkSignature(payload.hash(), signature, self.ownerPublicKey));
+        throwUnless(39, payload.loadAddress() == myAddress());
+        throwUnless(36, payload.loadUint(32) == self.seqno);
+        let validUntil: Int = payload.loadUint(32);
+        throwUnless(37, validUntil > 0 && now() <= validUntil && validUntil <= now() + 3600);
+        // Bootstrap only: no direct transfer, removal or replacement operation exists.
+        throwUnless(41, payload.loadUint(8) == OP_ADD_EXTENSION && !self.initialized);
+        let extension: Address = payload.loadAddress();
+        throwUnless(41, extension != myAddress());
         acceptMessage();
-
-        let msgSeqno: Int = msg.loadUint(32);
-        throwUnless(36, msgSeqno == self.seqno);
         self.seqno += 1;
-
-        let validUntil: Int = msg.loadUint(32);
-        throwUnless(37, validUntil == 0 || now() <= validUntil);
-
-        let op: Int = msg.loadUint(8);
-
-        if (op == OP_TRANSFER) {
-            let to: Address = msg.loadAddress();
-            let amount: Int = msg.loadCoins();
-            let mode: Int = msg.loadUint(8);
-            let body: Cell? = msg.loadMaybeRef();
-            send(SendParameters{ to: to, value: amount, mode: mode, body: body });
-        } else if (op == OP_ADD_EXTENSION) {
-            let extension: Address = msg.loadAddress();
-            self.extensions.set(extension, true);
-        } else if (op == OP_REMOVE_EXTENSION) {
-            let extension: Address = msg.loadAddress();
-            self.extensions.set(extension, null);
-        } else {
-            throw(41);
-        }
-
-        commit();
+        self.extensions.set(extension, true);
+        self.initialized = true;
+        self.module = extension;
     }
 
-    // Extension calls funds movement without any owner signature — the
-    // sole point where a future security module (timelock/allowlist)
-    // attaches, exactly mirroring executeFromExtension() on the EVM side.
-    // `sender()` here is set by the TON VM from the actual source
-    // contract of the internal message and cannot be spoofed by the
-    // sending contract, making this check equivalent to EVM's
-    // `msg.sender == extensions[...]`.
+    // Only the installed security module may request a transfer.
     receive(msg: ExecuteFromExtension) {
         throwUnless(38, self.extensions.get(sender()) == true);
-        send(SendParameters{ to: msg.to, value: msg.amount, mode: SendIgnoreErrors, body: msg.body });
+        self.destinations.set(msg.requestId, msg.to);
+        let body: Cell? = msg.body;
+        if (body == null) {
+            body = beginCell().storeUint(0, 32).storeUint(msg.requestId, 64).endCell();
+        }
+        send(SendParameters{ to: msg.to, value: msg.amount, mode: SendPayGasSeparately | SendBounceIfActionFail, body: body });
     }
+
+    // Correlate first asset-hop bounces by the standard query ID and expected sender.
+    bounced(body: Slice) {
+        if (body.bits() < 96) { return; }
+        body.loadUint(32);
+        let requestId: Int = body.loadUint(64);
+        if (self.destinations.get(requestId) != sender() || self.module == null) { return; }
+        self.destinations.set(requestId, null);
+        send(SendParameters{
+            to: self.module!!, value: 0, mode: SendRemainingValue,
+            body: WithdrawalFailed{ requestId: requestId }.toCell(),
+        });
+    }
+
+    get fun protocolVersion(): Int { return 2; }
 
     get fun seqno(): Int {
         return self.seqno;

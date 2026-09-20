@@ -20,9 +20,14 @@
 // what actually authorizes the fund movement on the wallet side.
 
 message ExecuteFromExtension {
+    requestId: Int as uint64;
     to: Address;
     amount: Int as coins;
     body: Cell?;
+}
+
+message WithdrawalFailed {
+    requestId: Int as uint64;
 }
 
 struct WithdrawalRequest {
@@ -34,9 +39,17 @@ struct WithdrawalRequest {
     // its own per-jetton wallet contract; you transfer BY messaging that
     // contract, not the jetton master).
     jettonWallet: Address?;
+    // null unless this request withdraws an NFT (TEP-62). Unlike jettons,
+    // an NFT has no separate per-holder wallet contract — the item
+    // contract itself tracks `owner_address`, so this is the NFT item's
+    // OWN address, the thing we message directly to transfer it.
+    // `amount`/`jettonWallet` are unused for an NFT withdrawal.
+    nftItemAddress: Address?;
     availableAt: Int as uint32;
     expiresAt: Int as uint32;
-    executed: Bool;
+    // Submitted is not proof of settlement on an asynchronous chain.
+    submitted: Bool;
+    failed: Bool;
     cancelled: Bool;
 }
 
@@ -65,9 +78,22 @@ const PARAM_CONFIRMATION_WINDOW: Int = 3;
 
 // Standard TEP-74 jetton transfer opcode.
 const JETTON_TRANSFER_OP: Int = 0x0f8a7ea5;
+// Standard TEP-62 NFT item transfer opcode.
+const NFT_TRANSFER_OP: Int = 0x5fcc3d14;
+
+// What kind of asset a withdrawal request moves — carried as a 2-bit
+// discriminant in the external message rather than a single hasJetton
+// bit, now that there are two non-native asset kinds to distinguish.
+const ASSET_NATIVE: Int = 0;
+const ASSET_JETTON: Int = 1;
+const ASSET_NFT: Int = 2;
+
+const MAX_DELAY: Int = 7776000; // 90 days
+const MAX_CONFIRMATION_WINDOW: Int = 2592000; // 30 days
 
 contract AvelockSecurityExtension {
     seqno: Int as uint32;
+    lastOperationHash: Int as uint256 = 0;
     ownerPublicKey: Int as uint256;
     walletAddress: Address;
 
@@ -82,8 +108,12 @@ contract AvelockSecurityExtension {
     minAddressDelay: Int as uint32;
 
     allowlistActiveAt: map<Address, Int as uint32>;
+    allowlistEpoch: map<Address, Int as uint64>;
+    requestEpoch: map<Int as uint64, Int as uint64>;
+    requestAssetEpoch: map<Int as uint64, Int as uint64>;
     nextRequestId: Int as uint64;
     requests: map<Int as uint64, WithdrawalRequest>;
+    requestIdByOperation: map<Int as uint32, Int as uint64>;
     pendingParamChanges: map<Int as uint8, PendingParamChange>;
 
     init(
@@ -99,6 +129,7 @@ contract AvelockSecurityExtension {
         throwUnless(50, withdrawalDelay >= minWithdrawalDelay);
         throwUnless(51, addressDelay >= minAddressDelay);
 
+        throwUnless(61, minWithdrawalDelay > 0 && minAddressDelay > 0);
         self.seqno = 0;
         self.ownerPublicKey = ownerPublicKey;
         self.walletAddress = walletAddress;
@@ -109,43 +140,64 @@ contract AvelockSecurityExtension {
         self.minWithdrawalDelay = minWithdrawalDelay;
         self.minAddressDelay = minAddressDelay;
         self.nextRequestId = 0;
+        self._validate(PARAM_WITHDRAWAL_DELAY, withdrawalDelay);
+        self._validate(PARAM_ADDRESS_DELAY, addressDelay);
+        self._validate(PARAM_POLICY_DELAY, policyDelay);
+        self._validate(PARAM_CONFIRMATION_WINDOW, confirmationWindow);
+
     }
 
     receive() {}
 
     external(msg: Slice) {
         let signature: Slice = msg.loadBits(512);
-        let signedHash: Int = msg.hash();
-        throwUnless(35, checkSignature(signedHash, signature, self.ownerPublicKey));
-
+        msg = msg.loadRef().beginParse();
+        let operationHash: Int = msg.hash();
+        throwUnless(35, checkSignature(operationHash, signature, self.ownerPublicKey));
+        throwUnless(39, msg.loadAddress() == myAddress());
+        throwUnless(36, msg.loadUint(32) == self.seqno);
+        let validUntil: Int = msg.loadUint(32);
+        throwUnless(37, validUntil > 0 && now() <= validUntil && validUntil <= now() + 3600);
         acceptMessage();
-
-        let msgSeqno: Int = msg.loadUint(32);
-        throwUnless(36, msgSeqno == self.seqno);
+        self.lastOperationHash = operationHash;
         self.seqno += 1;
 
         let op: Int = msg.loadUint(8);
 
         if (op == OP_ADD_ALLOWED_ADDRESS) {
             let destination: Address = msg.loadAddress();
-            self.allowlistActiveAt.set(destination, now() + self.addressDelay);
+            if (self.allowlistActiveAt.get(destination) == null) {
+                self.allowlistActiveAt.set(destination, now() + self.addressDelay);
+            }
         } else if (op == OP_REMOVE_ALLOWED_ADDRESS) {
             let destination: Address = msg.loadAddress();
+            self.allowlistEpoch.set(destination, self.epoch(destination) + 1);
             self.allowlistActiveAt.set(destination, null);
         } else if (op == OP_REQUEST_WITHDRAWAL) {
             let to: Address = msg.loadAddress();
             let amount: Int = msg.loadCoins();
-            // The optional jetton-wallet address is carried in a ref cell,
-            // not inline — signature(512) + seqno(32) + op(8) + two
-            // addresses(267 each) would overflow a single cell's 1023-bit
-            // limit otherwise.
-            let hasJetton: Int = msg.loadUint(1);
+            // Keep the optional asset address in a reference so the signed
+            // domain/header/destination payload remains within the cell bit limit.
+            let assetKind: Int = msg.loadUint(2);
             let jettonWallet: Address? = null;
-            if (hasJetton == 1) {
-                let jettonRef: Slice = msg.loadRef().beginParse();
-                jettonWallet = jettonRef.loadAddress();
+            let nftItemAddress: Address? = null;
+            if (assetKind == ASSET_JETTON) {
+                let assetRef: Slice = msg.loadRef().beginParse();
+                jettonWallet = assetRef.loadAddress();
+            } else if (assetKind == ASSET_NFT) {
+                let assetRef: Slice = msg.loadRef().beginParse();
+                nftItemAddress = assetRef.loadAddress();
             }
+            throwUnless(61, assetKind <= ASSET_NFT && (assetKind == ASSET_NFT || amount > 0));
             throwUnless(52, self.isAddressActive(to));
+            self.requestEpoch.set(self.nextRequestId, self.epoch(to));
+            let asset: Address? = jettonWallet;
+            if (nftItemAddress != null) { asset = nftItemAddress; }
+            if (asset != null) {
+                // Every TON recipient, including an asset contract receiving gas, is delayed/allowlisted.
+                throwUnless(52, self.isAddressActive(asset!!));
+                self.requestAssetEpoch.set(self.nextRequestId, self.epoch(asset!!));
+            }
 
             let availableAt: Int = now() + self.withdrawalDelay;
             let expiresAt: Int = availableAt + self.confirmationWindow;
@@ -153,26 +205,36 @@ contract AvelockSecurityExtension {
                 to: to,
                 amount: amount,
                 jettonWallet: jettonWallet,
+                nftItemAddress: nftItemAddress,
                 availableAt: availableAt,
                 expiresAt: expiresAt,
-                executed: false,
+                submitted: false,
+                failed: false,
                 cancelled: false,
             });
+            self.requestIdByOperation.set(self.seqno - 1, self.nextRequestId);
             self.nextRequestId += 1;
         } else if (op == OP_CANCEL_WITHDRAWAL) {
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
-            throwUnless(53, !req.executed && !req.cancelled);
+            throwUnless(53, !req.submitted && !req.cancelled);
             req.cancelled = true;
             self.requests.set(requestId, req);
         } else if (op == OP_CONFIRM_WITHDRAWAL) {
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
-            throwUnless(53, !req.executed && !req.cancelled);
+            throwUnless(53, !req.submitted && !req.cancelled);
             throwUnless(54, now() >= req.availableAt);
             throwUnless(55, now() <= req.expiresAt);
 
-            req.executed = true;
+            throwUnless(52, self.isAddressActive(req.to) && self.requestEpoch.get(requestId) == self.epoch(req.to));
+            let asset: Address? = req.jettonWallet;
+            if (req.nftItemAddress != null) { asset = req.nftItemAddress; }
+            if (asset != null) {
+                throwUnless(52, self.isAddressActive(asset!!) && self.requestAssetEpoch.get(requestId) == self.epoch(asset!!));
+            }
+            req.submitted = true;
+            req.failed = false;
             self.requests.set(requestId, req);
 
             // The withdrawn amount already lives in the wallet's own
@@ -181,14 +243,14 @@ contract AvelockSecurityExtension {
             // gas, paid out of the extension's balance, separately from
             // the wallet's subsequent send of `req.amount` (or jettons)
             // to `req.to`.
-            if (req.jettonWallet == null) {
+            if (req.jettonWallet == null && req.nftItemAddress == null) {
                 send(SendParameters{
                     to: self.walletAddress,
                     value: ton("0.05"),
                     mode: SendPayGasSeparately,
-                    body: ExecuteFromExtension{ to: req.to, amount: req.amount, body: null }.toCell(),
+                    body: ExecuteFromExtension{ requestId: requestId, to: req.to, amount: req.amount, body: null }.toCell(),
                 });
-            } else {
+            } else if (req.jettonWallet != null) {
                 // Jettons: the wallet holds them via its OWN per-jetton
                 // wallet contract (req.jettonWallet). We can't transfer
                 // "value" of a jetton directly — we instruct the wallet
@@ -199,7 +261,7 @@ contract AvelockSecurityExtension {
                 // false-return risk.
                 let jettonBody: Cell = beginCell()
                     .storeUint(JETTON_TRANSFER_OP, 32)
-                    .storeUint(0, 64)
+                    .storeUint(requestId, 64)
                     .storeCoins(req.amount)
                     .storeAddress(req.to)
                     .storeAddress(self.walletAddress)
@@ -212,7 +274,31 @@ contract AvelockSecurityExtension {
                     to: self.walletAddress,
                     value: ton("0.08"),
                     mode: SendPayGasSeparately,
-                    body: ExecuteFromExtension{ to: req.jettonWallet!!, amount: ton("0.05"), body: jettonBody }.toCell(),
+                    body: ExecuteFromExtension{ requestId: requestId, to: req.jettonWallet!!, amount: ton("0.05"), body: jettonBody }.toCell(),
+                });
+            } else {
+                // NFTs (TEP-62): unlike jettons, the wallet holds the item
+                // directly — req.nftItemAddress IS the item's own contract
+                // (there's no separate per-holder wallet the way jettons
+                // have one). A standard `transfer` message reassigns
+                // owner_address to req.to; a small forward_amount notifies
+                // the new owner's wallet so the transfer shows up the same
+                // way any other NFT transfer would in their client.
+                let nftBody: Cell = beginCell()
+                    .storeUint(NFT_TRANSFER_OP, 32)
+                    .storeUint(requestId, 64)
+                    .storeAddress(req.to)
+                    .storeAddress(self.walletAddress)
+                    .storeUint(0, 1)
+                    .storeCoins(1)
+                    .storeUint(0, 1)
+                    .endCell();
+
+                send(SendParameters{
+                    to: self.walletAddress,
+                    value: ton("0.08"),
+                    mode: SendPayGasSeparately,
+                    body: ExecuteFromExtension{ requestId: requestId, to: req.nftItemAddress!!, amount: ton("0.05"), body: nftBody }.toCell(),
                 });
             }
         } else if (op == OP_SET_WITHDRAWAL_DELAY) {
@@ -245,20 +331,51 @@ contract AvelockSecurityExtension {
             throw(60);
         }
 
-        commit();
+    }
+
+    receive(msg: WithdrawalFailed) {
+        throwUnless(38, sender() == self.walletAddress);
+        let req: WithdrawalRequest = self.requests.get(msg.requestId)!!;
+        req.failed = true;
+        // Do not automatically retry an asynchronous asset transfer.
+        self.requests.set(msg.requestId, req);
+    }
+
+    get fun lastOperationHash(): Int { return self.lastOperationHash; }
+
+    // Only a bounce from our wallet proves the first forwarding hop failed.
+    bounced(msg: bounced<ExecuteFromExtension>) {
+        if (sender() != self.walletAddress) { return; }
+        let req: WithdrawalRequest? = self.requests.get(msg.requestId);
+        if (req != null) {
+            let r: WithdrawalRequest = req!!;
+            r.submitted = false;
+            r.failed = true;
+            self.requests.set(msg.requestId, r);
+        }
+    }
+
+    fun epoch(addr: Address): Int {
+        let value: Int? = self.allowlistEpoch.get(addr);
+        if (value == null) { return 0; }
+        return value!!;
+    }
+
+    fun _validate(param: Int, value: Int) {
+        throwUnless(61, param >= 0 && param <= PARAM_CONFIRMATION_WINDOW);
+        let limit: Int = MAX_DELAY;
+        if (param == PARAM_CONFIRMATION_WINDOW) { limit = MAX_CONFIRMATION_WINDOW; }
+        throwUnless(61, value > 0 && value <= limit);
     }
 
     fun _proposeChange(param: Int, newValue: Int, currentValue: Int) {
-        if (newValue >= currentValue) {
-            self.pendingParamChanges.set(param, null);
-            self._writeParam(param, newValue);
-        } else {
-            self.pendingParamChanges.set(param, PendingParamChange{
-                newValue: newValue,
-                effectiveAt: now() + self.policyDelay,
-                exists: true,
-            });
-        }
+        self._validate(param, newValue);
+        if (newValue == currentValue) { return; }
+        self.pendingParamChanges.set(param, PendingParamChange{
+            newValue: newValue,
+            effectiveAt: now() + self.policyDelay,
+            exists: true,
+        });
     }
 
     fun _writeParam(param: Int, value: Int) {
@@ -273,6 +390,12 @@ contract AvelockSecurityExtension {
         }
     }
 
+    get fun addressActiveAt(addr: Address): Int {
+        let activeAt: Int? = self.allowlistActiveAt.get(addr);
+        if (activeAt == null) { return 0; }
+        return activeAt!!;
+    }
+
     get fun isAddressActive(addr: Address): Bool {
         let activeAt: Int? = self.allowlistActiveAt.get(addr);
         if (activeAt == null) {
@@ -280,6 +403,12 @@ contract AvelockSecurityExtension {
         }
         return now() >= activeAt!!;
     }
+
+    get fun walletAddress(): Address { return self.walletAddress; }
+
+    get fun ownerPublicKey(): Int { return self.ownerPublicKey; }
+
+    get fun protocolVersion(): Int { return 2; }
 
     get fun seqno(): Int {
         return self.seqno;
@@ -311,6 +440,10 @@ contract AvelockSecurityExtension {
 
     get fun nextRequestId(): Int {
         return self.nextRequestId;
+    }
+
+    get fun requestIdForOperation(operationSeqno: Int): Int? {
+        return self.requestIdByOperation.get(operationSeqno);
     }
 
     get fun request(id: Int): WithdrawalRequest? {

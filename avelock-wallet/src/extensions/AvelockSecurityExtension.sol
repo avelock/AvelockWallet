@@ -17,8 +17,7 @@ interface IAvelockWallet {
 /// @title AvelockSecurityExtension
 /// @notice The first Vault module: request -> delay -> confirm -> execute
 ///         withdrawals, plus an address allowlist with its own activation
-///         delay. Authorized on an AvelockWallet via addExtension(), so the
-///         base wallet core never changes when this logic evolves.
+///         delay. Permanently bound to an AvelockWallet at deployment.
 /// @dev Scope of this iteration: Withdrawal Delay, Address Delay, Final
 ///      Confirmation Window, allowlist add (delayed) / remove (immediate),
 ///      cancel, a Security Policy Delay gating any weakening change to
@@ -26,6 +25,13 @@ interface IAvelockWallet {
 ///      on withdrawalDelay/addressDelay that no owner action — not even a
 ///      policy-delayed one — can ever go below (threat-model section 14).
 contract AvelockSecurityExtension is IExtension {
+    function protocolVersion() external pure returns (uint256) {
+        return 2;
+    }
+
+    uint256 public constant MAX_DELAY = 90 days;
+    uint256 public constant MAX_CONFIRMATION_WINDOW = 30 days;
+
     enum Param {
         WithdrawalDelay,
         AddressDelay,
@@ -64,10 +70,7 @@ contract AvelockSecurityExtension is IExtension {
     uint256 public confirmationWindow;
     uint256 public policyDelay;
 
-    /// @dev A higher delay value is always the stronger setting for these
-    ///      parameters, so raising one applies immediately and lowering
-    ///      one queues a PendingParamChange gated by the CURRENT
-    ///      policyDelay (never the new one — see threat-model section 13).
+    /// @dev All parameter changes wait the current policy delay and obey fixed caps.
     mapping(Param => PendingParamChange) public pendingParamChanges;
 
     /// @dev 0 = never added; >0 = timestamp at which the address becomes
@@ -76,11 +79,21 @@ contract AvelockSecurityExtension is IExtension {
 
     uint256 public nextRequestId;
     mapping(uint256 => WithdrawalRequest) public requests;
+    mapping(address => uint256) public allowlistEpoch;
+    mapping(uint256 => uint256) public requestEpoch;
+    // 0: native/ERC20; 1: ERC721; 2: ERC1155. Separate maps preserve the request getter ABI.
+    mapping(uint256 => uint8) public assetKind;
+    mapping(uint256 => uint256) public tokenId;
 
     event AddressAdded(address indexed destination, uint256 activeAt);
     event AddressRemoved(address indexed destination);
     event WithdrawalRequested(
-        uint256 indexed requestId, address indexed to, address token, uint256 amount, uint256 availableAt, uint256 expiresAt
+        uint256 indexed requestId,
+        address indexed to,
+        address token,
+        uint256 amount,
+        uint256 availableAt,
+        uint256 expiresAt
     );
     event WithdrawalCancelled(uint256 indexed requestId);
     event WithdrawalExecuted(uint256 indexed requestId);
@@ -88,6 +101,8 @@ contract AvelockSecurityExtension is IExtension {
     event ParamChangeQueued(Param indexed param, uint256 newValue, uint256 effectiveAt);
     event ParamChangeCancelled(Param indexed param);
 
+    error InvalidParameter();
+    error InvalidAsset();
     error NotOwner();
     error DestinationNotAllowed();
     error RequestNotFound();
@@ -118,6 +133,11 @@ contract AvelockSecurityExtension is IExtension {
         if (_withdrawalDelay < _minWithdrawalDelay) revert BelowImmutableMinimum();
         if (_addressDelay < _minAddressDelay) revert BelowImmutableMinimum();
 
+        if (_minWithdrawalDelay == 0 || _minAddressDelay == 0) revert InvalidParameter();
+        _validate(Param.WithdrawalDelay, _withdrawalDelay);
+        _validate(Param.AddressDelay, _addressDelay);
+        _validate(Param.ConfirmationWindow, _confirmationWindow);
+        _validate(Param.PolicyDelay, _policyDelay);
         walletAddress = _wallet;
         withdrawalDelay = _withdrawalDelay;
         addressDelay = _addressDelay;
@@ -132,11 +152,7 @@ contract AvelockSecurityExtension is IExtension {
     }
 
     // ---------------------------------------------------------------
-    // Security Policy Delay — raising a delay strengthens the vault and
-    // takes effect immediately; lowering one weakens it and must wait out
-    // the CURRENT policyDelay (threat-model section 13: changing the
-    // policy delay itself follows the OLD rule, not the new one, so it
-    // can't be used to fast-track other weakenings).
+    // All policy changes are delayed, including increases that can harm availability.
     // ---------------------------------------------------------------
 
     function setWithdrawalDelay(uint256 newValue) external onlyOwner {
@@ -157,9 +173,7 @@ contract AvelockSecurityExtension is IExtension {
         _proposeChange(Param.PolicyDelay, newValue, policyDelay);
     }
 
-    /// @notice Finalize a queued weakening change once its delay has
-    ///         elapsed. A strengthening change never queues — it is
-    ///         applied immediately by the setter above.
+    /// @notice Finalize a bounded parameter change after the old policy delay.
     function applyParamChange(Param param) external onlyOwner {
         PendingParamChange storage p = pendingParamChanges[param];
         if (!p.exists) revert NoPendingChange();
@@ -170,25 +184,25 @@ contract AvelockSecurityExtension is IExtension {
         emit ParamChangeApplied(param, p.newValue);
     }
 
-    /// @notice Cancel a queued weakening change before it takes effect.
+    /// @notice Cancel a queued parameter change before it takes effect.
     function cancelParamChange(Param param) external onlyOwner {
         if (!pendingParamChanges[param].exists) revert NoPendingChange();
         delete pendingParamChanges[param];
         emit ParamChangeCancelled(param);
     }
 
+    function _validate(Param param, uint256 value) internal pure {
+        uint256 limit = param == Param.ConfirmationWindow ? MAX_CONFIRMATION_WINDOW : MAX_DELAY;
+        if (value == 0 || value > limit) revert InvalidParameter();
+    }
+
+    /// @dev Every actual parameter change waits under the current policy, including increases.
     function _proposeChange(Param param, uint256 newValue, uint256 currentValue) internal {
-        if (newValue >= currentValue) {
-            // Strengthening (or no-op): apply immediately, drop any stale
-            // pending weakening for this param.
-            delete pendingParamChanges[param];
-            _writeParam(param, newValue);
-            emit ParamChangeApplied(param, newValue);
-        } else {
-            uint256 effectiveAt = block.timestamp + policyDelay;
-            pendingParamChanges[param] = PendingParamChange({newValue: newValue, effectiveAt: effectiveAt, exists: true});
-            emit ParamChangeQueued(param, newValue, effectiveAt);
-        }
+        _validate(param, newValue);
+        if (newValue == currentValue) return;
+        uint256 effectiveAt = block.timestamp + policyDelay;
+        pendingParamChanges[param] = PendingParamChange(newValue, effectiveAt, true);
+        emit ParamChangeQueued(param, newValue, effectiveAt);
     }
 
     function _writeParam(Param param, uint256 value) internal {
@@ -210,12 +224,14 @@ contract AvelockSecurityExtension is IExtension {
 
     function addAllowedAddress(address destination) external onlyOwner {
         if (destination == address(0)) revert ZeroAddress();
+        if (allowlistActiveAt[destination] != 0) return;
         uint256 activeAt = block.timestamp + addressDelay;
         allowlistActiveAt[destination] = activeAt;
         emit AddressAdded(destination, activeAt);
     }
 
     function removeAllowedAddress(address destination) external onlyOwner {
+        allowlistEpoch[destination]++;
         delete allowlistActiveAt[destination];
         emit AddressRemoved(destination);
     }
@@ -229,10 +245,34 @@ contract AvelockSecurityExtension is IExtension {
     // Withdrawal lifecycle: request -> wait -> confirm -> execute
     // ---------------------------------------------------------------
 
-    function requestWithdrawal(address to, address token, uint256 amount) external onlyOwner returns (uint256 requestId) {
+    function requestWithdrawal(address to, address token, uint256 amount)
+        external
+        onlyOwner
+        returns (uint256 requestId)
+    {
+        return _request(to, token, amount, 0, 0);
+    }
+
+    function requestNFTWithdrawal(address to, address token, uint256 id, uint256 amount, bool is1155)
+        external
+        onlyOwner
+        returns (uint256)
+    {
+        if (token == address(0) || (!is1155 && amount != 1)) revert InvalidAsset();
+        return _request(to, token, amount, is1155 ? 2 : 1, id);
+    }
+
+    function _request(address to, address token, uint256 amount, uint8 kind, uint256 id)
+        internal
+        returns (uint256 requestId)
+    {
         if (!isAddressActive(to)) revert DestinationNotAllowed();
+        if (amount == 0 || (token != address(0) && token.code.length == 0)) revert InvalidAsset();
 
         requestId = nextRequestId++;
+        requestEpoch[requestId] = allowlistEpoch[to];
+        assetKind[requestId] = kind;
+        tokenId[requestId] = id;
         uint256 availableAt = block.timestamp + withdrawalDelay;
         uint256 expiresAt = availableAt + confirmationWindow;
 
@@ -269,10 +309,25 @@ contract AvelockSecurityExtension is IExtension {
         if (block.timestamp < r.availableAt) revert RequestNotReady();
         if (block.timestamp > r.expiresAt) revert RequestExpired();
 
+        if (!isAddressActive(r.to) || requestEpoch[requestId] != allowlistEpoch[r.to]) revert DestinationNotAllowed();
         r.executed = true;
 
         bytes memory data;
-        if (r.token == address(0)) {
+        uint8 kind = assetKind[requestId];
+        if (kind == 1) {
+            data = abi.encodeWithSignature(
+                "safeTransferFrom(address,address,uint256)", walletAddress, r.to, tokenId[requestId]
+            );
+        } else if (kind == 2) {
+            data = abi.encodeWithSignature(
+                "safeTransferFrom(address,address,uint256,uint256,bytes)",
+                walletAddress,
+                r.to,
+                tokenId[requestId],
+                r.amount,
+                bytes("")
+            );
+        } else if (r.token == address(0)) {
             data = "";
         } else {
             data = abi.encodeWithSignature("transfer(address,uint256)", r.to, r.amount);
@@ -290,7 +345,7 @@ contract AvelockSecurityExtension is IExtension {
         // check it ourselves — reverting here unwinds the whole tx,
         // including the token call, since nothing has been persisted
         // externally yet.
-        if (r.token != address(0) && returndata.length > 0) {
+        if (kind == 0 && r.token != address(0) && returndata.length > 0) {
             bool success = abi.decode(returndata, (bool));
             if (!success) revert Erc20TransferFailed();
         }
