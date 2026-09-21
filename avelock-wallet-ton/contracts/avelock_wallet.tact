@@ -13,6 +13,7 @@ contract AvelockWallet {
     extensions: map<Address, Bool>;
     initialized: Bool = false;
     destinations: map<Int as uint64, Address>;
+    correlationCreatedAt: map<Int as uint64, Int as uint32>;
     module: Address?;
 
     init(
@@ -50,11 +51,26 @@ contract AvelockWallet {
     receive(msg: ExecuteFromExtension) {
         throwUnless(38, self.extensions.get(sender()) == true);
         self.destinations.set(msg.requestId, msg.to);
+        self.correlationCreatedAt.set(msg.requestId, now());
         let body: Cell? = msg.body;
         if (body == null) {
             body = beginCell().storeUint(0, 32).storeUint(msg.requestId, 64).endCell();
         }
         send(SendParameters{ to: msg.to, value: msg.amount, mode: SendPayGasSeparately | SendBounceIfActionFail, body: body });
+    }
+
+    // Anyone may pay to clear expired diagnostics. This grants no spending
+    // authority and cannot remove correlation during the retention period.
+    receive(msg: PruneCorrelation) {
+        let createdAt: Int? = self.correlationCreatedAt.get(msg.requestId);
+        if (createdAt == null) { return; }
+        throwUnless(66, now() > createdAt!! + REQUEST_RETENTION);
+        self.destinations.set(msg.requestId, null);
+        self.correlationCreatedAt.set(msg.requestId, null);
+    }
+
+    get fun correlationDestination(requestId: Int): Address? {
+        return self.destinations.get(requestId);
     }
 
     // Only the installed security module may rotate the display copy of
@@ -73,13 +89,14 @@ contract AvelockWallet {
         let requestId: Int = body.loadUint(64);
         if (self.destinations.get(requestId) != sender() || self.module == null) { return; }
         self.destinations.set(requestId, null);
+        self.correlationCreatedAt.set(requestId, null);
         send(SendParameters{
             to: self.module!!, value: 0, mode: SendRemainingValue,
             body: WithdrawalFailed{ requestId: requestId }.toCell(),
         });
     }
 
-    get fun protocolVersion(): Int { return 4; }
+    get fun protocolVersion(): Int { return 1; }
     get fun networkGlobalId(): Int { return self.networkGlobalId; }
 
     get fun seqno(): Int {

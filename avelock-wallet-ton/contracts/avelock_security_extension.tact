@@ -27,6 +27,11 @@ message ExecuteFromExtension {
     body: Cell?;
 }
 
+// Expired correlation cleanup is retryable independently of request archival.
+message PruneCorrelation {
+    requestId: Int as uint64;
+}
+
 message WithdrawalFailed {
     requestId: Int as uint64;
 }
@@ -63,6 +68,15 @@ struct WithdrawalRequest {
     cancelled: Bool;
 }
 
+// Owner-approved transfer targets, separate from payment destinations.
+// rootAddress identifies the expected master/collection for client verification;
+// it is not an on-chain attestation of arbitrary third-party code.
+struct AssetRegistration {
+    kind: Int as uint8;
+    rootAddress: Address;
+    activeAt: Int as uint32;
+}
+
 struct PendingParamChange {
     newValue: Int as uint32;
     effectiveAt: Int as uint32;
@@ -84,6 +98,8 @@ const OP_PRUNE_REQUEST: Int = 12;
 const OP_PROPOSE_OWNER_ROTATION: Int = 13;
 const OP_APPLY_OWNER_ROTATION: Int = 14;
 const OP_CANCEL_OWNER_ROTATION: Int = 15;
+const OP_REGISTER_ASSET: Int = 16;
+const OP_REVOKE_ASSET: Int = 17;
 
 const PARAM_WITHDRAWAL_DELAY: Int = 0;
 const PARAM_ADDRESS_DELAY: Int = 1;
@@ -104,8 +120,8 @@ const ASSET_NFT: Int = 2;
 
 const MAX_DELAY: Int = 7776000; // 90 days
 const MAX_CONFIRMATION_WINDOW: Int = 2592000; // 30 days
-// How long a terminal request record (cancelled, settled, or expired
-// unconfirmed) is kept before it can be pruned — bounds unbounded
+// How long submitted or expired-unconfirmed records are retained.
+// Archival does not certify settlement. Records can be pruned — bounds unbounded
 // storage growth from years of use without erasing recent history.
 const REQUEST_RETENTION: Int = 15724800; // 182 days
 
@@ -131,6 +147,8 @@ contract AvelockSecurityExtension {
     allowlistEpoch: map<Address, Int as uint64>;
     requestEpoch: map<Int as uint64, Int as uint64>;
     requestAssetEpoch: map<Int as uint64, Int as uint64>;
+    registeredAssets: map<Address, AssetRegistration>;
+    assetEpochs: map<Address, Int as uint64>;
     nextRequestId: Int as uint64;
     requests: map<Int as uint64, WithdrawalRequest>;
     requestIdByOperation: map<Int as uint32, Int as uint64>;
@@ -193,7 +211,29 @@ contract AvelockSecurityExtension {
 
         let op: Int = msg.loadUint(8);
 
-        if (op == OP_ADD_ALLOWED_ADDRESS) {
+        if (op == OP_REGISTER_ASSET) {
+            let asset: Address = msg.loadAddress();
+            let kind: Int = msg.loadUint(2);
+            let rootAddress: Address = msg.loadRef().beginParse().loadAddress();
+            throwUnless(61, kind == ASSET_JETTON || kind == ASSET_NFT);
+            let existing: AssetRegistration? = self.registeredAssets.get(asset);
+            if (existing == null) {
+                // This target receives real TON fees. Client getter checks are
+                // not proofs, so never shorten the old destination protection.
+                let delay: Int = self.policyDelay;
+                if (self.addressDelay > delay) { delay = self.addressDelay; }
+                self.registeredAssets.set(asset, AssetRegistration{
+                    kind: kind, rootAddress: rootAddress, activeAt: now() + delay,
+                });
+            } else {
+                // Editing requires explicit revocation, invalidating old requests.
+                throwUnless(67, existing!!.kind == kind && existing!!.rootAddress == rootAddress);
+            }
+        } else if (op == OP_REVOKE_ASSET) {
+            let asset: Address = msg.loadAddress();
+            self.assetEpochs.set(asset, self.assetEpoch(asset) + 1);
+            self.registeredAssets.set(asset, null);
+        } else if (op == OP_ADD_ALLOWED_ADDRESS) {
             let destination: Address = msg.loadAddress();
             if (self.allowlistActiveAt.get(destination) == null) {
                 self.allowlistActiveAt.set(destination, now() + self.addressDelay);
@@ -223,9 +263,8 @@ contract AvelockSecurityExtension {
             let asset: Address? = jettonWallet;
             if (nftItemAddress != null) { asset = nftItemAddress; }
             if (asset != null) {
-                // Every TON recipient, including an asset contract receiving gas, is delayed/allowlisted.
-                throwUnless(52, self.isAddressActive(asset!!));
-                self.requestAssetEpoch.set(self.nextRequestId, self.epoch(asset!!));
+                throwUnless(67, self.isAssetActive(asset!!, assetKind));
+                self.requestAssetEpoch.set(self.nextRequestId, self.assetEpoch(asset!!));
             }
 
             let availableAt: Int = now() + self.withdrawalDelay;
@@ -251,17 +290,19 @@ contract AvelockSecurityExtension {
             req.cancelled = true;
             self.requests.set(requestId, req);
         } else if (op == OP_PRUNE_REQUEST) {
-            // A cancelled request never moved anything and may be removed
-            // immediately. A settled (submitted) or expired-unconfirmed
-            // one waits out the retention window first, so a completed
-            // withdrawal's record stays available for audit for a while —
-            // otherwise successfully settled requests would accumulate in
-            // storage forever. IDs are never reused.
+            // Archival is not settlement. After retention, late failure
+            // reporting ends; archived IDs can never be submitted again.
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
             let terminal: Bool = req.cancelled || req.submitted || now() > req.expiresAt;
             let retentionOk: Bool = req.cancelled || now() > req.expiresAt + REQUEST_RETENTION;
             throwUnless(66, terminal && retentionOk);
+            if (req.submitted) {
+                send(SendParameters{
+                    to: self.walletAddress, value: ton("0.01"), mode: SendPayGasSeparately,
+                    body: PruneCorrelation{ requestId: requestId }.toCell(),
+                });
+            }
             let operation: Int? = self.requestOperation.get(requestId);
             if (operation != null) { self.requestIdByOperation.set(operation!!, null); }
             self.requestOperation.set(requestId, null);
@@ -280,7 +321,9 @@ contract AvelockSecurityExtension {
             let asset: Address? = req.jettonWallet;
             if (req.nftItemAddress != null) { asset = req.nftItemAddress; }
             if (asset != null) {
-                throwUnless(52, self.isAddressActive(asset!!) && self.requestAssetEpoch.get(requestId) == self.epoch(asset!!));
+                let kind: Int = ASSET_JETTON;
+                if (req.nftItemAddress != null) { kind = ASSET_NFT; }
+                throwUnless(67, self.isAssetActive(asset!!, kind) && self.requestAssetEpoch.get(requestId) == self.assetEpoch(asset!!));
             }
             req.submitted = true;
             req.failed = false;
@@ -408,7 +451,9 @@ contract AvelockSecurityExtension {
 
     receive(msg: WithdrawalFailed) {
         throwUnless(38, sender() == self.walletAddress);
-        let req: WithdrawalRequest = self.requests.get(msg.requestId)!!;
+        let existing: WithdrawalRequest? = self.requests.get(msg.requestId);
+        if (existing == null) { return; } // Archived IDs stay absent.
+        let req: WithdrawalRequest = existing!!;
         req.failed = true;
         // Do not automatically retry an asynchronous asset transfer.
         self.requests.set(msg.requestId, req);
@@ -426,6 +471,22 @@ contract AvelockSecurityExtension {
             r.failed = true;
             self.requests.set(msg.requestId, r);
         }
+    }
+
+    fun assetEpoch(addr: Address): Int {
+        let value: Int? = self.assetEpochs.get(addr);
+        if (value == null) { return 0; }
+        return value!!;
+    }
+
+    get fun assetRegistration(addr: Address): AssetRegistration? {
+        return self.registeredAssets.get(addr);
+    }
+
+    get fun isAssetActive(addr: Address, kind: Int): Bool {
+        let asset: AssetRegistration? = self.registeredAssets.get(addr);
+        if (asset == null) { return false; }
+        return asset!!.kind == kind && now() >= asset!!.activeAt;
     }
 
     fun epoch(addr: Address): Int {
@@ -481,7 +542,7 @@ contract AvelockSecurityExtension {
 
     get fun ownerPublicKey(): Int { return self.ownerPublicKey; }
 
-    get fun protocolVersion(): Int { return 4; }
+    get fun protocolVersion(): Int { return 1; }
     get fun networkGlobalId(): Int { return self.networkGlobalId; }
     get fun operationalBalance(): Int { return myBalance(); }
     get fun minimumOperationalBalance(): Int { return ton("0.12"); }

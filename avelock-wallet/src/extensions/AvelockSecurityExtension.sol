@@ -27,7 +27,7 @@ interface IAvelockWallet {
 ///      policy-delayed one — can ever go below (threat-model section 14).
 contract AvelockSecurityExtension is IExtension {
     function protocolVersion() external pure returns (uint256) {
-        return 4;
+        return 1;
     }
 
     uint256 public constant MAX_DELAY = 90 days;
