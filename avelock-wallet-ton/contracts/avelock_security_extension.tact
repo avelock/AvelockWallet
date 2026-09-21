@@ -36,15 +36,6 @@ message WithdrawalFailed {
     requestId: Int as uint64;
 }
 
-// Sent to the wallet only by its own trusted module, only after the
-// module's policyDelay has elapsed on a proposed rotation — see
-// OP_PROPOSE_OWNER_ROTATION. There is no faster path: a compromised
-// owner key can be raced out via this same delayed path (by whoever
-// notices and signs first), never instantly revoked.
-message RotateOwner {
-    newOwnerPublicKey: Int as uint256;
-}
-
 struct WithdrawalRequest {
     to: Address;
     amount: Int as coins;
@@ -154,11 +145,6 @@ contract AvelockSecurityExtension {
     requestIdByOperation: map<Int as uint32, Int as uint64>;
     pendingParamChanges: map<Int as uint8, PendingParamChange>;
 
-    // A delayed owner-key rotation, gated by the same policyDelay as any
-    // other change. null = nothing pending.
-    pendingOwnerPublicKey: Int? = null;
-    pendingOwnerEffectiveAt: Int as uint32 = 0;
-
     init(
         ownerPublicKey: Int,
         networkGlobalId: Int,
@@ -173,7 +159,7 @@ contract AvelockSecurityExtension {
         throwUnless(50, withdrawalDelay >= minWithdrawalDelay);
         throwUnless(51, addressDelay >= minAddressDelay);
 
-        throwUnless(61, minWithdrawalDelay > 0 && minAddressDelay > 0);
+        throwUnless(61, minWithdrawalDelay > 0 && minAddressDelay > 0 && ownerPublicKey != 0);
         self.seqno = 0;
         self.ownerPublicKey = ownerPublicKey;
         throwUnless(65, networkGlobalId == chainGlobalId());
@@ -205,11 +191,12 @@ contract AvelockSecurityExtension {
         throwUnless(36, msg.loadUint(32) == self.seqno);
         let validUntil: Int = msg.loadUint(32);
         throwUnless(37, validUntil > 0 && now() <= validUntil && validUntil <= now() + 3600);
+        let op: Int = msg.loadUint(8);
+        // Reserved rotation operations never accept gas or consume a nonce.
+        throwUnless(68, op < OP_PROPOSE_OWNER_ROTATION || op > OP_CANCEL_OWNER_ROTATION);
         acceptMessage();
         self.lastOperationHash = operationHash;
         self.seqno += 1;
-
-        let op: Int = msg.loadUint(8);
 
         if (op == OP_REGISTER_ASSET) {
             let asset: Address = msg.loadAddress();
@@ -419,30 +406,6 @@ contract AvelockSecurityExtension {
             let pending: PendingParamChange = self.pendingParamChanges.get(param)!!;
             throwUnless(58, pending.exists);
             self.pendingParamChanges.set(param, null);
-        } else if (op == OP_PROPOSE_OWNER_ROTATION) {
-            let newOwnerPublicKey: Int = msg.loadUint(256);
-            self.pendingOwnerPublicKey = newOwnerPublicKey;
-            self.pendingOwnerEffectiveAt = now() + self.policyDelay;
-        } else if (op == OP_APPLY_OWNER_ROTATION) {
-            throwUnless(58, self.pendingOwnerPublicKey != null);
-            throwUnless(59, now() >= self.pendingOwnerEffectiveAt);
-            let newOwnerPublicKey: Int = self.pendingOwnerPublicKey!!;
-            self.pendingOwnerPublicKey = null;
-            // This extension's OWN key is what actually authorizes future
-            // signed messages (see external() above) — rotating it here is
-            // what matters. The wallet's ownerPublicKey is only a display
-            // copy (it has no owner-checked entrypoint of its own), synced
-            // for consistency, not for authority.
-            self.ownerPublicKey = newOwnerPublicKey;
-            send(SendParameters{
-                to: self.walletAddress,
-                value: ton("0.02"),
-                mode: SendPayGasSeparately,
-                body: RotateOwner{ newOwnerPublicKey: newOwnerPublicKey }.toCell(),
-            });
-        } else if (op == OP_CANCEL_OWNER_ROTATION) {
-            throwUnless(58, self.pendingOwnerPublicKey != null);
-            self.pendingOwnerPublicKey = null;
         } else {
             throw(60);
         }
@@ -591,11 +554,5 @@ contract AvelockSecurityExtension {
         return self.pendingParamChanges.get(param);
     }
 
-    get fun pendingOwnerPublicKey(): Int? {
-        return self.pendingOwnerPublicKey;
-    }
 
-    get fun pendingOwnerEffectiveAt(): Int {
-        return self.pendingOwnerEffectiveAt;
-    }
 }

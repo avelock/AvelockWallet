@@ -20,7 +20,7 @@ contract AvelockWallet is IERC721Receiver, IERC1155Receiver {
         return 1;
     }
 
-    address public owner;
+    address public immutable owner;
     address public securityExtension;
 
     mapping(address => bool) public extensions;
@@ -28,7 +28,6 @@ contract AvelockWallet is IERC721Receiver, IERC1155Receiver {
     event Sent(address indexed to, uint256 value, bytes data);
     event Received(address indexed from, uint256 value);
     event ExtensionAdded(address indexed extension);
-    event OwnerRotated(address indexed previousOwner, address indexed newOwner);
 
     error VaultOnly();
     error AlreadyInitialized();
@@ -123,16 +122,9 @@ contract AvelockWallet is IERC721Receiver, IERC1155Receiver {
         return _call(to, value, data);
     }
 
-    /// @notice Only the permanently installed module may rotate the owner
-    ///         key, and only after its own policy delay — see
-    ///         AvelockSecurityExtension.proposeOwnerRotation. There is no
-    ///         faster path: a compromised key can be raced out, never
-    ///         instantly revoked (see threat-model on key compromise).
-    function rotateOwner(address newOwner) external onlyExtension {
-        if (newOwner == address(0)) revert ZeroAddress();
-        emit OwnerRotated(owner, newOwner);
-        owner = newOwner;
-    }
+    /// @notice Owner-selected rotation is disabled: possession of a stolen
+    ///         owner key must not evict the original owner from this vault.
+    function rotateOwner(address) external pure { revert VaultOnly(); }
 
     /// @notice No bootstrap window: protection is installed in the constructor.
     function addExtension(address) external pure { revert AlreadyInitialized(); }

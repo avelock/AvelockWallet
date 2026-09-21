@@ -26,6 +26,7 @@ contract AvelockWallet {
         minWithdrawalDelay: Int,
         minAddressDelay: Int,
     ) {
+        throwUnless(61, ownerPublicKey != 0);
         self.seqno = 0;
         self.ownerPublicKey = ownerPublicKey;
         throwUnless(65, networkGlobalId == chainGlobalId());
@@ -71,15 +72,6 @@ contract AvelockWallet {
 
     get fun correlationDestination(requestId: Int): Address? {
         return self.destinations.get(requestId);
-    }
-
-    // Only the installed security module may rotate the display copy of
-    // the owner key — see RotateOwner in avelock_security_extension.tact.
-    // The module's OWN key is the real signing authority; this keeps the
-    // wallet's copy in sync for readers, it does not itself grant anything.
-    receive(msg: RotateOwner) {
-        throwUnless(38, self.extensions.get(sender()) == true);
-        self.ownerPublicKey = msg.newOwnerPublicKey;
     }
 
     // Correlate first asset-hop bounces by the standard query ID and expected sender.

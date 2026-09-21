@@ -12,7 +12,6 @@ import {IExtension} from "../interfaces/IExtension.sol";
 interface IAvelockWallet {
     function owner() external view returns (address);
     function executeFromExtension(address to, uint256 value, bytes calldata data) external returns (bytes memory);
-    function rotateOwner(address newOwner) external;
 }
 
 /// @title AvelockSecurityExtension
@@ -78,14 +77,6 @@ contract AvelockSecurityExtension is IExtension {
     /// @dev All parameter changes wait the current policy delay and obey fixed caps.
     mapping(Param => PendingParamChange) public pendingParamChanges;
 
-    /// @dev A delayed owner-key rotation, gated by the same policyDelay as
-    ///      any other change. There is no faster path: a compromised key
-    ///      can be raced out (by whoever notices and signs first), never
-    ///      instantly revoked — see threat-model on key compromise.
-    address public pendingOwner;
-    uint256 public pendingOwnerEffectiveAt;
-    bool public pendingOwnerExists;
-
     /// @dev 0 = never added; >0 = timestamp at which the address becomes
     ///      usable as a withdrawal destination.
     mapping(address => uint256) public allowlistActiveAt;
@@ -113,11 +104,9 @@ contract AvelockSecurityExtension is IExtension {
     event ParamChangeApplied(Param indexed param, uint256 newValue);
     event ParamChangeQueued(Param indexed param, uint256 newValue, uint256 effectiveAt);
     event ParamChangeCancelled(Param indexed param);
-    event OwnerRotationQueued(address indexed newOwner, uint256 effectiveAt);
-    event OwnerRotationApplied(address indexed newOwner);
-    event OwnerRotationCancelled(address indexed cancelledOwner);
     event RequestPruned(uint256 indexed requestId);
 
+    error OwnerRotationDisabled();
     error InvalidParameter();
     error InvalidAsset();
     error NotOwner();
@@ -208,41 +197,12 @@ contract AvelockSecurityExtension is IExtension {
         emit ParamChangeCancelled(param);
     }
 
-    // ---------------------------------------------------------------
-    // Owner-key rotation — the only way to move off a key without
-    // instantly handing equal, permanent power to whoever holds it if
-    // it's stolen. Gated by the current policyDelay, same as any other
-    // change; a compromised key can still race a legitimate rotation
-    // (whoever signs first wins), it just can no longer act forever.
-    // ---------------------------------------------------------------
-
-    function proposeOwnerRotation(address newOwner) external onlyOwner {
-        if (newOwner == address(0)) revert ZeroAddress();
-        pendingOwner = newOwner;
-        pendingOwnerEffectiveAt = block.timestamp + policyDelay;
-        pendingOwnerExists = true;
-        emit OwnerRotationQueued(newOwner, pendingOwnerEffectiveAt);
-    }
-
-    function applyOwnerRotation() external onlyOwner {
-        if (!pendingOwnerExists) revert NoPendingChange();
-        if (block.timestamp < pendingOwnerEffectiveAt) revert ChangeNotReady();
-        address newOwner = pendingOwner;
-        pendingOwnerExists = false;
-        delete pendingOwner;
-        delete pendingOwnerEffectiveAt;
-        IAvelockWallet(walletAddress).rotateOwner(newOwner);
-        emit OwnerRotationApplied(newOwner);
-    }
-
-    function cancelOwnerRotation() external onlyOwner {
-        if (!pendingOwnerExists) revert NoPendingChange();
-        address cancelled = pendingOwner;
-        pendingOwnerExists = false;
-        delete pendingOwner;
-        delete pendingOwnerEffectiveAt;
-        emit OwnerRotationCancelled(cancelled);
-    }
+    /// @notice Kept as rejecting selectors for callers of development builds.
+    ///         Recovery needs an independent authority committed at creation;
+    ///         delaying an owner-chosen replacement key does not provide that.
+    function proposeOwnerRotation(address) external pure { revert OwnerRotationDisabled(); }
+    function applyOwnerRotation() external pure { revert OwnerRotationDisabled(); }
+    function cancelOwnerRotation() external pure { revert OwnerRotationDisabled(); }
 
     function _validate(Param param, uint256 value) internal pure {
         uint256 limit = param == Param.ConfirmationWindow ? MAX_CONFIRMATION_WINDOW : MAX_DELAY;
