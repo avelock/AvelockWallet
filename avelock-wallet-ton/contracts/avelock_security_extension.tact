@@ -557,7 +557,7 @@ contract AvelockSecurityExtension {
 
     get fun ownerPublicKey(): Int { return self.ownerPublicKey; }
 
-    get fun protocolVersion(): Int { return 1; }
+    get fun protocolVersion(): Int { return 0; }
     get fun networkGlobalId(): Int { return self.networkGlobalId; }
     get fun operationalBalance(): Int { return myBalance(); }
     get fun minimumOperationalBalance(): Int { return ton("0.12"); }

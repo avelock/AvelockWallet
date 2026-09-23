@@ -17,7 +17,7 @@ import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 /// @dev Install the security module before depositing. No owner execution or upgrade path.
 contract AvelockWallet is IERC721Receiver, IERC1155Receiver {
     function protocolVersion() external pure returns (uint256) {
-        return 1;
+        return 0;
     }
 
     address public immutable owner;
