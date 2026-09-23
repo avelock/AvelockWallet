@@ -11,6 +11,23 @@ remappings = [
     "forge-std/=lib/forge-std/src/",
 ]
 
+# TRON's TVM follows the EVM up to London: no PUSH0/MCOPY/TSTORE.
+[profile.tron]
+src = "src"
+out = "out-tron"
+libs = ["lib"]
+solc_version = "0.8.26"
+evm_version = "london"
+# No CBOR metadata tail: keeps the bytecode purely executable for TVM checks.
+cbor_metadata = false
+bytecode_hash = "none"
+optimizer = true
+optimizer_runs = 200
+remappings = [
+    "@openzeppelin/=lib/openzeppelin-contracts/",
+    "forge-std/=lib/forge-std/src/",
+]
+
 [rpc_endpoints]
 sepolia = "${SEPOLIA_RPC_URL}"
 base_sepolia = "${BASE_SEPOLIA_RPC_URL}"

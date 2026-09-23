@@ -7,8 +7,15 @@ the contract-sources-only mirror of a larger project; application code,
 tests and CI live in the private development repository and are not
 published here.
 
-## Ethereum (Sepolia)
+## EVM chains and TRON
 
+The same Solidity source is used on Ethereum, Base, Arbitrum, Optimism,
+Polygon, BNB Chain and Avalanche (test networks), and on TRON (Nile).
+
+- `avelock-wallet/src/AvelockPersonalVault.sol` — the contract the app
+  deploys. Its constructor creates the wallet and its security module in
+  one transaction with the owner-chosen initial policy (delays and
+  permanent minimums).
 - `avelock-wallet/src/AvelockWallet.sol` — base wallet account. Its
   constructor deploys and permanently binds its one security module
   atomically; there is no separate bootstrap step and no owner-execution
@@ -16,6 +23,10 @@ published here.
 - `avelock-wallet/src/extensions/AvelockSecurityExtension.sol` — Vault
   module (withdrawal delay, address allowlist, security policy delay,
   NFT withdrawal path).
+
+TRON builds use the `tron` Foundry profile (`FOUNDRY_PROFILE=tron forge
+build src/AvelockPersonalVault.sol`): London EVM, no CBOR metadata, since
+the TVM has no PUSH0/MCOPY/TSTORE.
 
 No current on-chain deployment of this source is endorsed here. Earlier
 commits to this repository referenced Sepolia/TON testnet addresses from
