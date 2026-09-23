@@ -48,6 +48,12 @@ contract AvelockWallet {
     // the deposit straight back to the sender instead of keeping it.
     receive() {}
 
+    // Accept any other incoming value too — text-comment deposits (exchange
+    // memos), jetton transfer_notification, NFT ownership_assigned. Without
+    // this Tact rejects them (exit 130) and the deposit bounces back.
+    // Typed receivers above/below still take precedence; nothing changes state.
+    receive(msg: Slice) {}
+
     // Only the installed security module may request a transfer.
     receive(msg: ExecuteFromExtension) {
         throwUnless(38, self.extensions.get(sender()) == true);
@@ -57,7 +63,7 @@ contract AvelockWallet {
         if (body == null) {
             body = beginCell().storeUint(0, 32).storeUint(msg.requestId, 64).endCell();
         }
-        send(SendParameters{ to: msg.to, value: msg.amount, mode: SendPayGasSeparately | SendBounceIfActionFail, body: body });
+        send(SendParameters{ to: msg.to, value: msg.amount, mode: SendPayGasSeparately | SendBounceIfActionFail, body: body, bounce: msg.bounce });
     }
 
     // Anyone may pay to clear expired diagnostics. This grants no spending
@@ -82,8 +88,10 @@ contract AvelockWallet {
         if (self.destinations.get(requestId) != sender() || self.module == null) { return; }
         self.destinations.set(requestId, null);
         self.correlationCreatedAt.set(requestId, null);
+        // Pay only the notification's gas. SendRemainingValue would forward the
+        // whole bounced amount — the returned withdrawal — out of the Vault.
         send(SendParameters{
-            to: self.module!!, value: 0, mode: SendRemainingValue,
+            to: self.module!!, value: ton("0.01"), mode: SendPayGasSeparately,
             body: WithdrawalFailed{ requestId: requestId }.toCell(),
         });
     }

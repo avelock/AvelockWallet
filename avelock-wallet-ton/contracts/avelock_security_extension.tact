@@ -25,6 +25,9 @@ message ExecuteFromExtension {
     to: Address;
     amount: Int as coins;
     body: Cell?;
+    // Outbound bounce flag. False lets native TON reach an undeployed
+    // (never-used) wallet, which would otherwise bounce it back.
+    bounce: Bool;
 }
 
 // Expired correlation cleanup is retryable independently of request archival.
@@ -57,6 +60,12 @@ struct WithdrawalRequest {
     submitted: Bool;
     failed: Bool;
     cancelled: Bool;
+    // Optional TEP-standard text comment (op 0 + UTF-8), e.g. an exchange
+    // deposit memo. Native TON: the transfer body. Jetton/NFT: forward_payload.
+    comment: Cell?;
+    // Native TON only: send bounceable (safe default) or not. Asset hops
+    // always go to a deployed jetton-wallet/NFT item and stay bounceable.
+    bounceable: Bool;
 }
 
 // Owner-approved transfer targets, separate from payment destinations.
@@ -119,6 +128,9 @@ const REQUEST_RETENTION: Int = 15724800; // 182 days
 contract AvelockSecurityExtension {
     seqno: Int as uint32;
     lastOperationHash: Int as uint256 = 0;
+    // Signed operations that were accepted (nonce consumed) but failed.
+    lastFailedOperationHash: Int as uint256 = 0;
+    lastFailureCode: Int as int32 = 0;
     ownerPublicKey: Int as uint256;
     networkGlobalId: Int as int32;
     requestOperation: map<Int as uint64, Int as uint32>;
@@ -181,6 +193,10 @@ contract AvelockSecurityExtension {
 
     receive() {}
 
+    // Operational-balance top-ups may carry a text comment; accept them
+    // instead of bouncing (exit 130). No state change.
+    receive(msg: Slice) {}
+
     external(msg: Slice) {
         let signature: Slice = msg.loadBits(512);
         msg = msg.loadRef().beginParse();
@@ -195,9 +211,12 @@ contract AvelockSecurityExtension {
         // Reserved rotation operations never accept gas or consume a nonce.
         throwUnless(68, op < OP_PROPOSE_OWNER_ROTATION || op > OP_CANCEL_OWNER_ROTATION);
         acceptMessage();
-        self.lastOperationHash = operationHash;
+        // Consume the nonce before running the operation. If the operation
+        // throws, try/catch discards its partial changes but keeps this
+        // increment, so the same signed message can't be replayed to burn
+        // the module's gas balance (it fails the seqno check pre-accept).
         self.seqno += 1;
-
+        try {
         if (op == OP_REGISTER_ASSET) {
             let asset: Address = msg.loadAddress();
             let kind: Int = msg.loadUint(2);
@@ -244,6 +263,18 @@ contract AvelockSecurityExtension {
                 let assetRef: Slice = msg.loadRef().beginParse();
                 nftItemAddress = assetRef.loadAddress();
             }
+            // Optional text comment, carried in its own reference.
+            let comment: Cell? = msg.loadMaybeRef();
+            if (comment != null) {
+                let c: Slice = comment!!.beginParse();
+                // Text comments only (op 0), single cell (≤123 bytes) — no
+                // arbitrary message bodies to allowlisted contracts, and no
+                // unbounded storage in request records.
+                throwUnless(69, c.bits() >= 32 && c.loadUint(32) == 0 && c.refs() == 0);
+            }
+            let bounceable: Bool = msg.loadBool();
+            // Non-bounceable delivery is only meaningful for native TON.
+            throwUnless(70, bounceable || assetKind == ASSET_NATIVE);
             throwUnless(61, assetKind <= ASSET_NFT && (assetKind == ASSET_NFT || amount > 0));
             throwUnless(52, self.isAddressActive(to));
             self.requestEpoch.set(self.nextRequestId, self.epoch(to));
@@ -266,6 +297,8 @@ contract AvelockSecurityExtension {
                 submitted: false,
                 failed: false,
                 cancelled: false,
+                comment: comment,
+                bounceable: bounceable,
             });
             self.requestIdByOperation.set(self.seqno - 1, self.nextRequestId);
             self.requestOperation.set(self.nextRequestId, self.seqno - 1);
@@ -327,7 +360,10 @@ contract AvelockSecurityExtension {
                     to: self.walletAddress,
                     value: ton("0.05"),
                     mode: SendPayGasSeparately,
-                    body: ExecuteFromExtension{ requestId: requestId, to: req.to, amount: req.amount, body: null }.toCell(),
+                    // With a comment the body is a plain text comment, so the
+                    // wallet can't correlate a destination-side bounce to this
+                    // request; the TON still returns to the Vault. See SECURITY.md.
+                    body: ExecuteFromExtension{ requestId: requestId, to: req.to, amount: req.amount, body: req.comment, bounce: req.bounceable }.toCell(),
                 });
             } else if (req.jettonWallet != null) {
                 // Jettons: the wallet holds them via its OWN per-jetton
@@ -345,15 +381,18 @@ contract AvelockSecurityExtension {
                     .storeAddress(req.to)
                     .storeAddress(self.walletAddress)
                     .storeUint(0, 1)
-                    .storeCoins(0)
-                    .storeUint(0, 1)
+                    // forward_ton_amount > 0 so the recipient receives a
+                    // transfer_notification carrying the comment (exchanges
+                    // read the memo from it).
+                    .storeCoins(req.comment == null ? 0 : 1)
+                    .storeSlice(self._forwardPayload(req.comment))
                     .endCell();
 
                 send(SendParameters{
                     to: self.walletAddress,
                     value: ton("0.08"),
                     mode: SendPayGasSeparately,
-                    body: ExecuteFromExtension{ requestId: requestId, to: req.jettonWallet!!, amount: ton("0.05"), body: jettonBody }.toCell(),
+                    body: ExecuteFromExtension{ requestId: requestId, to: req.jettonWallet!!, amount: ton("0.05"), body: jettonBody, bounce: true }.toCell(),
                 });
             } else {
                 // NFTs (TEP-62): unlike jettons, the wallet holds the item
@@ -370,14 +409,14 @@ contract AvelockSecurityExtension {
                     .storeAddress(self.walletAddress)
                     .storeUint(0, 1)
                     .storeCoins(1)
-                    .storeUint(0, 1)
+                    .storeSlice(self._forwardPayload(req.comment))
                     .endCell();
 
                 send(SendParameters{
                     to: self.walletAddress,
                     value: ton("0.08"),
                     mode: SendPayGasSeparately,
-                    body: ExecuteFromExtension{ requestId: requestId, to: req.nftItemAddress!!, amount: ton("0.05"), body: nftBody }.toCell(),
+                    body: ExecuteFromExtension{ requestId: requestId, to: req.nftItemAddress!!, amount: ton("0.05"), body: nftBody, bounce: true }.toCell(),
                 });
             }
         } else if (op == OP_SET_WITHDRAWAL_DELAY) {
@@ -409,6 +448,11 @@ contract AvelockSecurityExtension {
         } else {
             throw(60);
         }
+            self.lastOperationHash = operationHash;
+        } catch (code) {
+            self.lastFailedOperationHash = operationHash;
+            self.lastFailureCode = code;
+        }
 
     }
 
@@ -423,6 +467,8 @@ contract AvelockSecurityExtension {
     }
 
     get fun lastOperationHash(): Int { return self.lastOperationHash; }
+    get fun lastFailedOperationHash(): Int { return self.lastFailedOperationHash; }
+    get fun lastFailureCode(): Int { return self.lastFailureCode; }
 
     // Only a bounce from our wallet proves the first forwarding hop failed.
     bounced(msg: bounced<ExecuteFromExtension>) {
@@ -456,6 +502,12 @@ contract AvelockSecurityExtension {
         let value: Int? = self.allowlistEpoch.get(addr);
         if (value == null) { return 0; }
         return value!!;
+    }
+
+    // TEP-74/TEP-62 forward_payload (Either Cell ^Cell): empty inline, or the comment by reference.
+    fun _forwardPayload(comment: Cell?): Slice {
+        if (comment == null) { return beginCell().storeUint(0, 1).asSlice(); }
+        return beginCell().storeUint(1, 1).storeRef(comment!!).asSlice();
     }
 
     fun _validate(param: Int, value: Int) {
