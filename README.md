@@ -54,3 +54,7 @@ same reason as above.
   be detected on-chain — TEP-74/TEP-62 have no standard success
   acknowledgment. This is a property of TON's asynchronous messaging,
   not something this contract can close unilaterally.
+
+## License
+
+Avelock Wallet is licensed under the [Business Source License 1.1](LICENSE) (source-available, not open source). The source can be read, audited, modified and used to verify deployed contracts. Individuals may use it to hold and manage their own assets in their own Vault. Commercial use — including embedding it in wallets, exchanges, custody, SDKs or hosted services — requires a commercial license from Avelock. Each version converts to GPL-2.0-or-later on the Change Date (2030-09-23) or four years after its first public release, whichever comes first. Third-party dependencies (for example `lib/forge-std`) keep their own licenses.
