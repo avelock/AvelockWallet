@@ -66,6 +66,24 @@ same reason as above.
   acknowledgment. This is a property of TON's asynchronous messaging,
   not something this contract can close unilaterally.
 
+## Bitcoin (signet)
+
+Bitcoin has no deployed contract: the vault's rules are the address
+itself, a Taproot output with no usable key path (BIP-341 NUMS internal
+key) and one script leaf per spending path:
+
+- **cosigned** — owner + Avelock signer, spendable immediately. Delays and
+  the allowlist on this path are enforced by the signer, off-chain.
+- **reserve** — owner alone, after `reserveBlocks` (CSV). Works without
+  the signer, so the owner never depends on it to recover funds.
+- **heir** — optional inheritance key, after `heirBlocks` (> reserve).
+
+Sources: `avelock-wallet-bitcoin/src/vault.ts` (address and leaves),
+`keys.ts` (owner key derivation, `m/86'/<coin>'/100'/0/<generation>`),
+`spend.ts` (building and signing spends). Anyone can rebuild a vault
+address from its public keys and parameters and compare. `npm install &&
+npm run build` compiles them.
+
 ## License
 
 Avelock Wallet is licensed under the [Business Source License 1.1](LICENSE) (source-available, not open source). The source can be read, audited, modified and used to verify deployed contracts. Individuals may use it to hold and manage their own assets in their own Vault. Commercial use — including embedding it in wallets, exchanges, custody, SDKs or hosted services — requires a commercial license from Avelock. Each version converts to GPL-2.0-or-later on the Change Date (2030-09-23) or four years after its first public release, whichever comes first. Third-party dependencies (for example `lib/forge-std`) keep their own licenses.
