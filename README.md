@@ -7,28 +7,49 @@ the contract-sources-only mirror of a larger project; application code,
 tests and CI live in the private development repository and are not
 published here.
 
+
+## Networks
+
+| Network | Folder | Source |
+|---|---|---|
+| Ethereum | [`networks/ethereum`](networks/ethereum) | [`contracts/evm`](contracts/evm) |
+| Base | [`networks/base`](networks/base) | [`contracts/evm`](contracts/evm) |
+| Arbitrum | [`networks/arbitrum`](networks/arbitrum) | [`contracts/evm`](contracts/evm) |
+| Optimism | [`networks/optimism`](networks/optimism) | [`contracts/evm`](contracts/evm) |
+| Polygon | [`networks/polygon`](networks/polygon) | [`contracts/evm`](contracts/evm) |
+| BNB Chain | [`networks/bnb-chain`](networks/bnb-chain) | [`contracts/evm`](contracts/evm) |
+| Avalanche | [`networks/avalanche`](networks/avalanche) | [`contracts/evm`](contracts/evm) |
+| Tron | [`networks/tron`](networks/tron) | [`contracts/evm`](contracts/evm) (TVM build) |
+| TON | [`networks/ton`](networks/ton) | [`contracts/ton`](contracts/ton) |
+| Bitcoin | [`networks/bitcoin`](networks/bitcoin) | [`contracts/utxo`](contracts/utxo) |
+| Litecoin | [`networks/litecoin`](networks/litecoin) | [`contracts/utxo`](contracts/utxo) |
+
+Each network folder explains how a Vault is created there, its test-network
+addresses and how to verify one. The code itself lives once per technology in
+`contracts/`, so every network runs exactly the same reviewed source.
+
 ## EVM chains and TRON
 
 The same Solidity source is used on Ethereum, Base, Arbitrum, Optimism,
 Polygon, BNB Chain and Avalanche (test networks), and on TRON (Nile).
 
-- `avelock-wallet/src/AvelockVaultFactory.sol` — creates each Vault as two
+- `contracts/evm/src/AvelockVaultFactory.sol` — creates each Vault as two
   EIP-1167 minimal proxies (wallet + security module) of immutable
   implementations, bound in one transaction; ~365k gas instead of a
   ~2.76M-gas full deployment. No owner, admin or upgrade. The caller is
   always the Vault owner. It is deployed through the deterministic CREATE2
   deployer (`0x4e59b44847b379578588920ca78fbf26c0b4956c`, salt 0), so its
   address is the same on every chain and is derived from its exact code.
-- `avelock-wallet/src/AvelockPersonalVault.sol` — full deployment of the
+- `contracts/evm/src/AvelockPersonalVault.sol` — full deployment of the
   same two contracts, used where the deterministic deployer is unavailable
   (e.g. TRON). Creates and binds both atomically with the owner-chosen
   initial policy.
-- `avelock-wallet/src/AvelockWallet.sol` — base wallet account. Its one
+- `contracts/evm/src/AvelockWallet.sol` — base wallet account. Its one
   security module is bound by a one-time `initialize()` that only its
   deployer (the factory or the full-deployment receipt) can call, in the
   same transaction that creates it; there is no owner-execution bypass of
   that module.
-- `avelock-wallet/src/extensions/AvelockSecurityExtension.sol` — Vault
+- `contracts/evm/src/extensions/AvelockSecurityExtension.sol` — Vault
   module (withdrawal delay, address allowlist, security policy delay,
   NFT withdrawal path).
 
@@ -45,10 +66,10 @@ trusting it as a deployment of this revision.
 
 ## TON (testnet)
 
-- `avelock-wallet-ton/contracts/avelock_wallet.tact` — base wallet
+- `contracts/ton/contracts/avelock_wallet.tact` — base wallet
   account, same permanent-module-at-construction model as the EVM side,
   plus a `networkGlobalId`-bound signed-message envelope.
-- `avelock-wallet-ton/contracts/avelock_security_extension.tact` — Vault
+- `contracts/ton/contracts/avelock_security_extension.tact` — Vault
   module, same state machine as the EVM side.
 
 No current on-chain deployment of this source is endorsed here, for the
@@ -90,7 +111,7 @@ key) and one script leaf per spending path:
 
 Litecoin has Taproot, so the same scripts are used there (`networks.ts`);
 its CSV cap (65,535 blocks of 2.5 minutes, ~113 days) limits the reserve
-period. Sources: `avelock-wallet-bitcoin/src/vault.ts` (address and leaves),
+period. Sources: `contracts/utxo/src/vault.ts` (address and leaves),
 `keys.ts` (owner key derivation, `m/86'/<coin>'/100'/0/<generation>`, coin 0
 Bitcoin, 1 Bitcoin test networks, 2 Litecoin),
 `spend.ts` (building and signing spends). Anyone can rebuild a vault
