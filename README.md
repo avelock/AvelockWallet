@@ -12,14 +12,22 @@ published here.
 The same Solidity source is used on Ethereum, Base, Arbitrum, Optimism,
 Polygon, BNB Chain and Avalanche (test networks), and on TRON (Nile).
 
-- `avelock-wallet/src/AvelockPersonalVault.sol` — the contract the app
-  deploys. Its constructor creates the wallet and its security module in
-  one transaction with the owner-chosen initial policy (delays and
-  permanent minimums).
-- `avelock-wallet/src/AvelockWallet.sol` — base wallet account. Its
-  constructor deploys and permanently binds its one security module
-  atomically; there is no separate bootstrap step and no owner-execution
-  bypass of that module.
+- `avelock-wallet/src/AvelockVaultFactory.sol` — creates each Vault as two
+  EIP-1167 minimal proxies (wallet + security module) of immutable
+  implementations, bound in one transaction; ~365k gas instead of a
+  ~2.76M-gas full deployment. No owner, admin or upgrade. The caller is
+  always the Vault owner. It is deployed through the deterministic CREATE2
+  deployer (`0x4e59b44847b379578588920ca78fbf26c0b4956c`, salt 0), so its
+  address is the same on every chain and is derived from its exact code.
+- `avelock-wallet/src/AvelockPersonalVault.sol` — full deployment of the
+  same two contracts, used where the deterministic deployer is unavailable
+  (e.g. TRON). Creates and binds both atomically with the owner-chosen
+  initial policy.
+- `avelock-wallet/src/AvelockWallet.sol` — base wallet account. Its one
+  security module is bound by a one-time `initialize()` that only its
+  deployer (the factory or the full-deployment receipt) can call, in the
+  same transaction that creates it; there is no owner-execution bypass of
+  that module.
 - `avelock-wallet/src/extensions/AvelockSecurityExtension.sol` — Vault
   module (withdrawal delay, address allowlist, security policy delay,
   NFT withdrawal path).
@@ -55,7 +63,9 @@ same reason as above.
   lockbox with no recovery path.
 - `AvelockSecurityExtension` pays TON out of its own balance to forward
   each confirmed withdrawal (`confirmWithdrawal` requires
-  `myBalance() >= minimumOperationalBalance()`, currently 0.12 TON).
+  `myBalance() >= minimumOperationalBalance()`, currently 0.07 TON; each
+  native withdrawal attaches 0.01 TON of gas, most of which stays in the
+  wallet).
   Withdrawals stop working, without any loss of funds, if that balance
   runs out — top it up like any other active contract.
 - `submitted` on a request means the withdrawal was forwarded, not that
@@ -66,7 +76,7 @@ same reason as above.
   acknowledgment. This is a property of TON's asynchronous messaging,
   not something this contract can close unilaterally.
 
-## Bitcoin (signet)
+## Bitcoin (signet) and Litecoin (testnet)
 
 Bitcoin has no deployed contract: the vault's rules are the address
 itself, a Taproot output with no usable key path (BIP-341 NUMS internal
@@ -78,8 +88,11 @@ key) and one script leaf per spending path:
   the signer, so the owner never depends on it to recover funds.
 - **heir** — optional inheritance key, after `heirBlocks` (> reserve).
 
-Sources: `avelock-wallet-bitcoin/src/vault.ts` (address and leaves),
-`keys.ts` (owner key derivation, `m/86'/<coin>'/100'/0/<generation>`),
+Litecoin has Taproot, so the same scripts are used there (`networks.ts`);
+its CSV cap (65,535 blocks of 2.5 minutes, ~113 days) limits the reserve
+period. Sources: `avelock-wallet-bitcoin/src/vault.ts` (address and leaves),
+`keys.ts` (owner key derivation, `m/86'/<coin>'/100'/0/<generation>`, coin 0
+Bitcoin, 1 Bitcoin test networks, 2 Litecoin),
 `spend.ts` (building and signing spends). Anyone can rebuild a vault
 address from its public keys and parameters and compare. `npm install &&
 npm run build` compiles them.

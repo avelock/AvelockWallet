@@ -5,7 +5,8 @@
 //
 //   m/86'/<coin>'/100'/0/<generation>
 //
-// <coin> is 0 on mainnet and 1 on test networks. <generation> increments
+// <coin> is the SLIP-44 coin type (see networks.ts): 0 Bitcoin, 1 Bitcoin
+// test networks, 2 Litecoin. <generation> increments
 // on every vault refresh, so each refresh gets a new vault address and a
 // wallet can rediscover all generations by scanning upward from 0.
 // Signer keys are never derived from the owner's seed.
@@ -15,13 +16,14 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import { BIP32Factory, BIP32Interface } from 'bip32';
 import * as bip39 from 'bip39';
 import type { Signer } from './spend';
+import { coinType } from './networks';
 
 const bip32 = BIP32Factory(ecc);
 
 export const OWNER_ACCOUNT = 100;
 
 export function ownerPath(network: bitcoin.Network, generation: number): string {
-  const coin = network === bitcoin.networks.bitcoin ? 0 : 1;
+  const coin = coinType(network);
   return `m/86'/${coin}'/${OWNER_ACCOUNT}'/0/${generation}`;
 }
 
@@ -30,7 +32,7 @@ export function ownerPath(network: bitcoin.Network, generation: number): string 
 
 /** Account-level xpub (m/86'/<coin>'/100'); generation keys are its public children 0/<generation>. */
 export function ownerAccountXpubFromSeed(seed: Uint8Array, network: bitcoin.Network): string {
-  const coin = network === bitcoin.networks.bitcoin ? 0 : 1;
+  const coin = coinType(network);
   const root = bip32.fromSeed(Buffer.from(seed), network);
   return root.derivePath(`m/86'/${coin}'/${OWNER_ACCOUNT}'`).neutered().toBase58();
 }
@@ -61,7 +63,7 @@ export function ownerKey(mnemonic: string, network: bitcoin.Network, generation 
 /** Standard BIP-86 key (m/86'/<coin>'/0'/0/0) for an inheritance-sheet wallet. */
 export function heirKey(mnemonic: string, network: bitcoin.Network): Signer {
   if (!bip39.validateMnemonic(mnemonic)) throw new Error('invalid mnemonic');
-  const coin = network === bitcoin.networks.bitcoin ? 0 : 1;
+  const coin = coinType(network);
   const root = bip32.fromSeed(bip39.mnemonicToSeedSync(mnemonic), network);
   return taprootSigner(root.derivePath(`m/86'/${coin}'/0'/0/0`));
 }

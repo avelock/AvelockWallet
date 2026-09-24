@@ -25,10 +25,14 @@ contract AvelockPersonalVault {
         uint256 minAddressDelay
     ) {
         owner = msg.sender;
-        wallet = new AvelockWallet(
-            msg.sender, withdrawalDelay, addressDelay, confirmationWindow, policyDelay,
+        // Full deployment (used where the clone factory is unavailable, e.g.
+        // TRON): this receipt creates and binds both contracts atomically.
+        wallet = new AvelockWallet();
+        extension = new AvelockSecurityExtension();
+        extension.initialize(
+            address(wallet), withdrawalDelay, addressDelay, confirmationWindow, policyDelay,
             minWithdrawalDelay, minAddressDelay
         );
-        extension = AvelockSecurityExtension(wallet.securityExtension());
+        wallet.initialize(msg.sender, address(extension));
     }
 }

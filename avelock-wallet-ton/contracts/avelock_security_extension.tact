@@ -330,7 +330,7 @@ contract AvelockSecurityExtension {
             self.requestEpoch.set(requestId, null);
             self.requestAssetEpoch.set(requestId, null);
         } else if (op == OP_CONFIRM_WITHDRAWAL) {
-            throwUnless(64, myBalance() >= ton("0.12"));
+            throwUnless(64, myBalance() >= ton("0.07"));
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
             throwUnless(53, !req.submitted && !req.cancelled);
@@ -358,7 +358,8 @@ contract AvelockSecurityExtension {
             if (req.jettonWallet == null && req.nftItemAddress == null) {
                 send(SendParameters{
                     to: self.walletAddress,
-                    value: ton("0.05"),
+                    // The wallet's processing costs ~0.001 TON; the rest stays in the Vault.
+                    value: ton("0.01"),
                     mode: SendPayGasSeparately,
                     // With a comment the body is a plain text comment, so the
                     // wallet can't correlate a destination-side bounce to this
@@ -390,7 +391,9 @@ contract AvelockSecurityExtension {
 
                 send(SendParameters{
                     to: self.walletAddress,
-                    value: ton("0.08"),
+                    // 0.05 is forwarded to the jetton wallet / NFT item (the
+                    // standard transfer budget), ~0.001 is the wallet's own gas.
+                    value: ton("0.06"),
                     mode: SendPayGasSeparately,
                     body: ExecuteFromExtension{ requestId: requestId, to: req.jettonWallet!!, amount: ton("0.05"), body: jettonBody, bounce: true }.toCell(),
                 });
@@ -414,7 +417,9 @@ contract AvelockSecurityExtension {
 
                 send(SendParameters{
                     to: self.walletAddress,
-                    value: ton("0.08"),
+                    // 0.05 is forwarded to the jetton wallet / NFT item (the
+                    // standard transfer budget), ~0.001 is the wallet's own gas.
+                    value: ton("0.06"),
                     mode: SendPayGasSeparately,
                     body: ExecuteFromExtension{ requestId: requestId, to: req.nftItemAddress!!, amount: ton("0.05"), body: nftBody, bounce: true }.toCell(),
                 });
@@ -560,7 +565,7 @@ contract AvelockSecurityExtension {
     get fun protocolVersion(): Int { return 0; }
     get fun networkGlobalId(): Int { return self.networkGlobalId; }
     get fun operationalBalance(): Int { return myBalance(); }
-    get fun minimumOperationalBalance(): Int { return ton("0.12"); }
+    get fun minimumOperationalBalance(): Int { return ton("0.07"); }
 
     get fun seqno(): Int {
         return self.seqno;

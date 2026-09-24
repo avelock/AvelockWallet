@@ -59,15 +59,18 @@ contract AvelockSecurityExtension is IExtension {
         bool cancelled;
     }
 
-    address public immutable walletAddress;
+    /// @dev The only address allowed to initialize (the factory for clones).
+    address public immutable deployer;
+
+    address public walletAddress;
 
     /// @dev Permanent floors set once at deployment. No setter, no
     ///      governance path, no policy-delay bypass can ever push
     ///      withdrawalDelay/addressDelay below these — see threat-model
     ///      section 14 ("Immutable Minimum"). A Vault meant to hold funds
     ///      for years should set these deliberately high at creation.
-    uint256 public immutable minWithdrawalDelay;
-    uint256 public immutable minAddressDelay;
+    uint256 public minWithdrawalDelay;
+    uint256 public minAddressDelay;
 
     uint256 public withdrawalDelay;
     uint256 public addressDelay;
@@ -120,13 +123,21 @@ contract AvelockSecurityExtension is IExtension {
     error ChangeNotReady();
     error BelowImmutableMinimum();
     error Erc20TransferFailed();
+    error AlreadyInitialized();
 
     modifier onlyOwner() {
         if (msg.sender != IAvelockWallet(walletAddress).owner()) revert NotOwner();
         _;
     }
 
-    constructor(
+    constructor() {
+        deployer = msg.sender;
+    }
+
+    /// @notice Sets the wallet and the initial policy. Callable once, only by
+    ///         the deployer, in the transaction that created this module.
+    ///         The minimums are permanent: nothing can write them again.
+    function initialize(
         address _wallet,
         uint256 _withdrawalDelay,
         uint256 _addressDelay,
@@ -134,7 +145,9 @@ contract AvelockSecurityExtension is IExtension {
         uint256 _policyDelay,
         uint256 _minWithdrawalDelay,
         uint256 _minAddressDelay
-    ) {
+    ) external {
+        if (msg.sender != deployer) revert NotOwner();
+        if (walletAddress != address(0)) revert AlreadyInitialized();
         if (_wallet == address(0)) revert ZeroAddress();
         if (_withdrawalDelay < _minWithdrawalDelay) revert BelowImmutableMinimum();
         if (_addressDelay < _minAddressDelay) revert BelowImmutableMinimum();
