@@ -21,6 +21,7 @@ published here.
 | Avalanche | [`networks/avalanche`](networks/avalanche) | [`contracts/evm`](contracts/evm) |
 | Tron | [`networks/tron`](networks/tron) | [`contracts/evm`](contracts/evm) (TVM build) |
 | TON | [`networks/ton`](networks/ton) | [`contracts/ton`](contracts/ton) |
+| Solana | [`networks/solana`](networks/solana) | [`contracts/solana`](contracts/solana) (not deployed yet) |
 | Bitcoin | [`networks/bitcoin`](networks/bitcoin) | [`contracts/utxo`](contracts/utxo) |
 | Litecoin | [`networks/litecoin`](networks/litecoin) | [`contracts/utxo`](contracts/utxo) |
 
