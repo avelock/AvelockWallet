@@ -13,6 +13,10 @@ permanent security module `AvelockSecurityExtension`
 Both addresses are derived from the owner key and the chosen policy; deploy and
 fund both before depositing.
 
+Current contracts report `protocolVersion()` = 1: setting a policy parameter
+back to its current value withdraws a change queued for it. Vaults created with
+protocol 0 keep their code and keep working.
+
 ## Operational balance
 
 The module pays the network fees of owner operations (~0.001–0.002 TON each)

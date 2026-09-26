@@ -1,11 +1,24 @@
 # Avelock Wallet — contract sources
 
 Self-custody vault with on-chain withdrawal delays. This repository
-contains the smart contract sources for both supported chains, published
-for on-chain source verification (Etherscan / verifier.ton.org). It is
-the contract-sources-only mirror of a larger project; application code,
-tests and CI live in the private development repository and are not
-published here.
+contains the contract and script sources for every supported network —
+EVM chains, TRON, TON, Solana, Bitcoin and Litecoin — published so anyone
+can verify what runs on-chain (Etherscan / Tronscan / verifier.ton.org, or
+by rebuilding a Bitcoin/Litecoin address). It is the sources-only mirror of
+a larger project; application code, tests and CI live in the private
+development repository and are not published here.
+
+Every Vault follows the same rules on every network:
+
+- a withdrawal is requested first and can be confirmed only after the
+  owner-chosen delay, and only to an address on the Vault's allowlist;
+- a new allowed address, and any weakening of the policy, also waits out
+  its own delay; stopping actions (cancel, lock) are always immediate;
+- optional **guard keys** can cancel a pending withdrawal or trigger a
+  **Panic Lock**, but can never move funds, add addresses or unlock;
+  lifting a lock waits `lockDelay`.
+
+All networks are test networks for now.
 
 
 ## Networks
@@ -52,7 +65,8 @@ Polygon, BNB Chain and Avalanche (test networks), and on TRON (Nile).
   that module.
 - `contracts/evm/src/extensions/AvelockSecurityExtension.sol` — Vault
   module (withdrawal delay, address allowlist, security policy delay,
-  NFT withdrawal path).
+  NFT withdrawal path, guard keys and Panic Lock). `protocolVersion()`
+  returns 0 for this revision.
 
 TRON builds use the `tron` Foundry profile (`FOUNDRY_PROFILE=tron forge
 build src/AvelockPersonalVault.sol`): London EVM, no CBOR metadata, since
@@ -71,7 +85,15 @@ trusting it as a deployment of this revision.
   account, same permanent-module-at-construction model as the EVM side,
   plus a `networkGlobalId`-bound signed-message envelope.
 - `contracts/ton/contracts/avelock_security_extension.tact` — Vault
-  module, same state machine as the EVM side.
+  module, same state machine as the EVM side, including guard keys and
+  Panic Lock.
+
+Both TON contracts report `protocolVersion()` = **1**. Protocol 1 fixes one
+behaviour of protocol 0: setting a policy parameter back to its current
+value now withdraws a change queued for that parameter (in protocol 0 the
+queued change stayed and could still be applied later). Vaults created
+with protocol 0 keep working and keep their old code — contracts are never
+upgraded in place.
 
 No current on-chain deployment of this source is endorsed here, for the
 same reason as above.
@@ -96,7 +118,22 @@ same reason as above.
   message but fails its own internal transfer without bouncing cannot
   be detected on-chain — TEP-74/TEP-62 have no standard success
   acknowledgment. This is a property of TON's asynchronous messaging,
-  not something this contract can close unilaterally.
+  not something this contract can close unilaterally. The Avelock app
+  therefore reads the whole message trace from two independent indexers
+  and reports "delivered" or "failed" only when both agree; it never
+  resends a withdrawal on its own.
+
+## Solana (devnet)
+
+- `contracts/solana` — one shared Anchor program; each Vault is a PDA of
+  the owner key (`["avelock-vault", owner]`) with its permanent security
+  extension (`["avelock-extension", vault]`). Same rules as the other
+  networks: delayed withdrawals to allowed addresses only, delayed policy
+  changes, guard keys and Panic Lock. SOL, SPL tokens and NFTs.
+- Program id `9r172eBe2XJ9PPFH8rmb6XbxNkrNLkMnqBZmSfCwUiXD`, deployed on
+  Devnet and **still upgradeable**. Before any Vault holds real value the
+  program must be made immutable and checked against a reviewed build of
+  this source. Build and test: `cd contracts/solana && cargo test --locked`.
 
 ## Bitcoin (signet) and Litecoin (testnet)
 
@@ -104,8 +141,12 @@ Bitcoin has no deployed contract: the vault's rules are the address
 itself, a Taproot output with no usable key path (BIP-341 NUMS internal
 key) and one script leaf per spending path:
 
-- **cosigned** — owner + Avelock signer, spendable immediately. Delays and
-  the allowlist on this path are enforced by the signer, off-chain.
+- **cosigned** — owner + `threshold` of the Avelock signers, spendable
+  immediately. New vaults use **2 of 3** independent signers (one leaf per
+  pair of signers), so no single signer can block or approve a spend.
+  Delays, the allowlist and Panic Lock on this path are enforced by the
+  signers, off-chain; if they disagree, the app stops and treats it as an
+  alarm.
 - **reserve** — owner alone, after `reserveBlocks` (CSV). Works without
   the signer, so the owner never depends on it to recover funds.
 - **heir** — optional inheritance key, after `heirBlocks` (> reserve).

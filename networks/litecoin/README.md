@@ -10,8 +10,9 @@ for Bitcoin and Litecoin ([`networks.ts`](../../contracts/utxo/src/networks.ts) 
 Litecoin has no smart contracts. The Vault is a Taproot address with no usable
 key path and one script leaf per spending path:
 
-- **cosigned** — owner + Avelock signer, spendable immediately. The withdrawal
-  delay and allowed addresses on this path are enforced by the signer.
+- **cosigned** — owner + 2 of 3 independent Avelock signers (one leaf per
+  pair), spendable immediately. The withdrawal delay, allowed addresses and
+  Panic Lock on this path are enforced by the signers.
 - **reserve** — owner alone after the reserve period 100 days (57,600 blocks of ~2.5 minutes; the CSV cap of 65,535 blocks is ~113 days), enforced by Litecoin itself. The
   owner never depends on the signer to recover funds.
 - **heir** — optional inheritance key, later than the reserve path.
