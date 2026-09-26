@@ -1,4 +1,6 @@
-// Owner and inheritance keys derived from BIP-39 mnemonics.
+// Owner and inheritance keys derived from BIP-39 seeds. Mnemonic-based
+// helpers live in mnemonicKeys.ts, so the app bundle (which derives the
+// seed natively) does not carry bip39 and its word lists (audit P-12).
 //
 // Owner vault keys use a dedicated BIP-86-style account so they never
 // collide with an ordinary single-key Taproot wallet on the same seed:
@@ -14,11 +16,10 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { BIP32Factory, BIP32Interface } from 'bip32';
-import * as bip39 from 'bip39';
 import type { Signer } from './spend';
 import { coinType } from './networks';
 
-const bip32 = BIP32Factory(ecc);
+export const bip32 = BIP32Factory(ecc);
 
 export const OWNER_ACCOUNT = 100;
 
@@ -42,11 +43,6 @@ export function ownerKeyFromSeed(seed: Uint8Array, network: bitcoin.Network, gen
   return taprootSigner(root.derivePath(ownerPath(network, generation)));
 }
 
-export function ownerAccountXpub(mnemonic: string, network: bitcoin.Network): string {
-  if (!bip39.validateMnemonic(mnemonic)) throw new Error('invalid mnemonic');
-  return ownerAccountXpubFromSeed(bip39.mnemonicToSeedSync(mnemonic), network);
-}
-
 /** x-only owner key of a generation, derived from the account xpub alone. */
 export function ownerPublicKey(accountXpub: string, network: bitcoin.Network, generation: number): Buffer {
   if (!Number.isInteger(generation) || generation < 0 || generation >= 0x80000000) throw new Error('invalid generation');
@@ -55,17 +51,14 @@ export function ownerPublicKey(accountXpub: string, network: bitcoin.Network, ge
   return Buffer.from(node.derive(0).derive(generation).publicKey.subarray(1, 33));
 }
 
-export function ownerKey(mnemonic: string, network: bitcoin.Network, generation = 0): Signer {
-  if (!bip39.validateMnemonic(mnemonic)) throw new Error('invalid mnemonic');
-  return ownerKeyFromSeed(bip39.mnemonicToSeedSync(mnemonic), network, generation);
-}
-
-/** Standard BIP-86 key (m/86'/<coin>'/0'/0/0) for an inheritance-sheet wallet. */
-export function heirKey(mnemonic: string, network: bitcoin.Network): Signer {
-  if (!bip39.validateMnemonic(mnemonic)) throw new Error('invalid mnemonic');
-  const coin = coinType(network);
-  const root = bip32.fromSeed(bip39.mnemonicToSeedSync(mnemonic), network);
-  return taprootSigner(root.derivePath(`m/86'/${coin}'/0'/0/0`));
+/** Owner keys of generations [from, to) with one xpub parse and one /0 derivation. */
+export function ownerPublicKeys(accountXpub: string, network: bitcoin.Network, from: number, to: number): Buffer[] {
+  const node = bip32.fromBase58(accountXpub, network);
+  if (node.depth !== 3 || node.privateKey) throw new Error('expected a neutered account-level xpub');
+  const external = node.derive(0);
+  const out: Buffer[] = [];
+  for (let g = from; g < to; g++) out.push(Buffer.from(external.derive(g).publicKey.subarray(1, 33)));
+  return out;
 }
 
 /**

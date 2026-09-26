@@ -1,5 +1,7 @@
 use anchor_lang::prelude::*;
 
+use crate::errors::AvelockError;
+
 // ============================================================
 // Avelock Wallet — Solana port
 // Self-custody vault with on-chain withdrawal delays.
@@ -38,7 +40,17 @@ pub const PARAM_WITHDRAWAL_DELAY: u8 = 0;
 pub const PARAM_ADDRESS_DELAY: u8 = 1;
 pub const PARAM_CONFIRMATION_WINDOW: u8 = 2;
 pub const PARAM_POLICY_DELAY: u8 = 3;
-pub const PARAM_COUNT: usize = 4;
+pub const PARAM_LOCK_DELAY: u8 = 4;
+pub const PARAM_COUNT: usize = 5;
+
+/// Guard keys and Panic Lock (FEATURE_PLANS.md, B1/B2).
+pub const MAX_GUARDS: usize = 2;
+/// Default wait before the owner can lift a lock (at least the withdrawal delay).
+pub const DEFAULT_LOCK_DELAY: i64 = 7 * 24 * 60 * 60;
+/// Lock times kept to decide whether a destination was still waiting when a
+/// lock came. Older than this and the destination counts as voided (it must
+/// be added again) — the safe side of not knowing.
+pub const LOCK_HISTORY: usize = 4;
 
 /// Mirrors AvelockWallet: owner + the one module account trusted to move funds.
 #[account]
@@ -89,12 +101,23 @@ pub struct SecurityExtension {
 
     pub next_request_id: u64,
 
-    /// All four parameter changes wait the *current* policy delay and
+    /// All parameter changes wait the *current* policy delay and
     /// obey the fixed caps above, including increases — see
     /// `_proposeChange` on the EVM side. Indexed by PARAM_* above.
     pub pending: [PendingParamChange; PARAM_COUNT],
 
     pub bump: u8,
+
+    /// Stop-only second keys: cancel and lock, nothing else.
+    pub guards: [GuardSlot; MAX_GUARDS],
+    pub lock_delay: i64,
+    pub locked: bool,
+    pub unlock_after: i64,
+    /// Bumped by every lock; requests and waiting destinations from before
+    /// a lock can no longer be used.
+    pub lock_epoch: u64,
+    /// `lock_times[(e - 1) % LOCK_HISTORY]` is when lock epoch `e` began.
+    pub lock_times: [i64; LOCK_HISTORY],
 }
 
 impl SecurityExtension {
@@ -104,7 +127,126 @@ impl SecurityExtension {
         + 8 * 6 // the six delay/minimum fields
         + 8 // next_request_id
         + PendingParamChange::SPACE * PARAM_COUNT
-        + 1; // bump
+        + 1 // bump
+        + GuardSlot::SPACE * MAX_GUARDS
+        + 8 // lock_delay
+        + 1 // locked
+        + 8 // unlock_after
+        + 8 // lock_epoch
+        + 8 * LOCK_HISTORY; // lock_times
+
+    pub fn guard_index(&self, key: &Pubkey) -> Option<usize> {
+        if *key == Pubkey::default() {
+            return None;
+        }
+        self.guards.iter().position(|g| g.key == *key)
+    }
+
+    /// An added guard is active once its wait is over (and until removed).
+    pub fn is_guard(&self, key: &Pubkey, now: i64) -> bool {
+        self.guard_index(key).map_or(false, |i| now >= self.guards[i].active_at)
+    }
+
+    pub fn add_guard(&mut self, key: Pubkey, owner: &Pubkey, now: i64) -> Result<()> {
+        require!(key != Pubkey::default() && key != *owner, AvelockError::InvalidParameter);
+        require!(self.guard_index(&key).is_none(), AvelockError::GuardExists);
+        let free = self.guards.iter().position(|g| g.key == Pubkey::default()).ok_or(AvelockError::TooManyGuards)?;
+        self.guards[free] = GuardSlot { key, active_at: now + self.address_delay, removable_at: 0 };
+        Ok(())
+    }
+
+    /// A guard still waiting is dropped at once; an active one is queued for
+    /// removal and stays active for `address_delay`.
+    pub fn remove_guard(&mut self, key: &Pubkey, now: i64) -> Result<()> {
+        let i = self.guard_index(key).ok_or(AvelockError::GuardNotFound)?;
+        let address_delay = self.address_delay;
+        let g = &mut self.guards[i];
+        if now < g.active_at {
+            *g = GuardSlot::default();
+        } else if g.removable_at == 0 {
+            g.removable_at = now + address_delay;
+        }
+        Ok(())
+    }
+
+    /// Drops a guard that is still waiting (used by guards: stop-only).
+    pub fn drop_pending_guard(&mut self, key: &Pubkey, now: i64) -> Result<()> {
+        let i = self.guard_index(key).ok_or(AvelockError::GuardNotFound)?;
+        require!(now < self.guards[i].active_at, AvelockError::NotPending);
+        self.guards[i] = GuardSlot::default();
+        Ok(())
+    }
+
+    pub fn cancel_guard_removal(&mut self, key: &Pubkey) -> Result<()> {
+        let i = self.guard_index(key).ok_or(AvelockError::GuardNotFound)?;
+        require!(self.guards[i].removable_at != 0, AvelockError::NotPending);
+        self.guards[i].removable_at = 0;
+        Ok(())
+    }
+
+    pub fn finalize_guard_removal(&mut self, key: &Pubkey, now: i64) -> Result<()> {
+        let i = self.guard_index(key).ok_or(AvelockError::GuardNotFound)?;
+        let at = self.guards[i].removable_at;
+        require!(at != 0, AvelockError::NotPending);
+        require!(now >= at, AvelockError::ChangeNotReady);
+        self.guards[i] = GuardSlot::default();
+        Ok(())
+    }
+
+    /// Panic Lock: instant. Voids pending requests and waiting destinations
+    /// (by epoch), cancels queued changes and waiting guards. Locking again
+    /// extends the wait.
+    pub fn lock(&mut self, now: i64) {
+        let until = now + self.lock_delay;
+        if self.locked {
+            self.unlock_after = self.unlock_after.max(until);
+            return;
+        }
+        self.locked = true;
+        self.unlock_after = until;
+        self.lock_epoch += 1;
+        self.lock_times[((self.lock_epoch - 1) % LOCK_HISTORY as u64) as usize] = now;
+        self.pending = [PendingParamChange::default(); PARAM_COUNT];
+        for g in self.guards.iter_mut() {
+            if g.key != Pubkey::default() && now < g.active_at {
+                *g = GuardSlot::default();
+            }
+        }
+    }
+
+    /// Only the owner unlocks, and only after `unlock_after`.
+    pub fn unlock(&mut self, now: i64) -> Result<()> {
+        require!(self.locked, AvelockError::NotLocked);
+        require!(now >= self.unlock_after, AvelockError::LockNotExpired);
+        self.locked = false;
+        Ok(())
+    }
+
+    /// True when the first lock after `added_epoch` came before `active_at`
+    /// (the destination was still waiting), or is too old to know.
+    pub fn voided_by_lock(&self, added_epoch: u64, active_at: i64) -> bool {
+        if self.lock_epoch <= added_epoch {
+            return false;
+        }
+        let first = added_epoch + 1;
+        if self.lock_epoch - first >= LOCK_HISTORY as u64 {
+            return true;
+        }
+        self.lock_times[((first - 1) % LOCK_HISTORY as u64) as usize] < active_at
+    }
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, PartialEq, Debug)]
+pub struct GuardSlot {
+    /// Pubkey::default() = empty slot.
+    pub key: Pubkey,
+    pub active_at: i64,
+    /// 0 = no removal queued.
+    pub removable_at: i64,
+}
+
+impl GuardSlot {
+    pub const SPACE: usize = 32 + 8 + 8;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default)]
@@ -131,14 +273,17 @@ pub struct AllowlistEntry {
     pub active_at: i64,
     pub epoch: u64,
     pub bump: u8,
+    /// The extension's lock epoch when this destination was added.
+    pub lock_epoch_at_add: u64,
 }
 
 impl AllowlistEntry {
     pub const SEED_PREFIX: &'static [u8] = b"avelock-allowlist";
-    pub const SPACE: usize = 8 + 32 + 32 + 8 + 8 + 1;
+    pub const SPACE: usize = 8 + 32 + 32 + 8 + 8 + 1 + 8;
 
-    pub fn is_active(&self, now: i64) -> bool {
-        self.active_at != 0 && now >= self.active_at
+    /// Usable: past its wait, and not voided by a lock that came while it waited.
+    pub fn is_active(&self, extension: &SecurityExtension, now: i64) -> bool {
+        self.active_at != 0 && now >= self.active_at && !extension.voided_by_lock(self.lock_epoch_at_add, self.active_at)
     }
 }
 
@@ -170,6 +315,8 @@ pub struct WithdrawalRequest {
     pub executed: bool,
     pub cancelled: bool,
     pub bump: u8,
+    /// Must still equal the extension's lock epoch at confirmation.
+    pub lock_epoch_at_request: u64,
 }
 
 impl WithdrawalRequest {
@@ -185,10 +332,16 @@ impl WithdrawalRequest {
         + 8 // epoch_at_request
         + 1 // executed
         + 1 // cancelled
-        + 1; // bump
+        + 1 // bump
+        + 8; // lock_epoch_at_request
 
-    pub fn is_terminal(&self, now: i64) -> bool {
-        self.executed || self.cancelled || now > self.expires_at
+    pub fn is_terminal(&self, now: i64, extension: &SecurityExtension) -> bool {
+        self.executed || self.cancelled || self.is_annulled(extension) || now > self.expires_at
+    }
+
+    /// Voided by a lock after it was made.
+    pub fn is_annulled(&self, extension: &SecurityExtension) -> bool {
+        !self.executed && self.lock_epoch_at_request != extension.lock_epoch
     }
 
     /// A cancelled request never moved anything and may be pruned
@@ -196,7 +349,149 @@ impl WithdrawalRequest {
     /// waits out `REQUEST_RETENTION` first, so a completed withdrawal's
     /// record stays available for audit for a while — see
     /// AvelockSecurityExtension.pruneRequest.
-    pub fn retention_satisfied(&self, now: i64) -> bool {
-        self.cancelled || now > self.expires_at + REQUEST_RETENTION
+    pub fn retention_satisfied(&self, now: i64, extension: &SecurityExtension) -> bool {
+        self.cancelled || self.is_annulled(extension) || now > self.expires_at + REQUEST_RETENTION
+    }
+}
+
+#[cfg(test)]
+mod guard_lock_tests {
+    use super::*;
+
+    const DAY: i64 = 24 * 60 * 60;
+
+    fn extension() -> SecurityExtension {
+        SecurityExtension {
+            wallet: Pubkey::new_unique(),
+            withdrawal_delay: DAY,
+            address_delay: 2 * DAY,
+            confirmation_window: DAY,
+            policy_delay: 3 * DAY,
+            min_withdrawal_delay: DAY,
+            min_address_delay: DAY,
+            next_request_id: 0,
+            pending: [PendingParamChange::default(); PARAM_COUNT],
+            bump: 0,
+            guards: [GuardSlot::default(); MAX_GUARDS],
+            lock_delay: DEFAULT_LOCK_DELAY,
+            locked: false,
+            unlock_after: 0,
+            lock_epoch: 0,
+            lock_times: [0; LOCK_HISTORY],
+        }
+    }
+
+    fn entry(ext: &SecurityExtension, active_at: i64) -> AllowlistEntry {
+        AllowlistEntry { extension: Pubkey::new_unique(), destination: Pubkey::new_unique(), active_at, epoch: 0, bump: 0, lock_epoch_at_add: ext.lock_epoch }
+    }
+
+    #[test]
+    fn a_guard_waits_the_address_delay_and_there_are_at_most_two() {
+        let owner = Pubkey::new_unique();
+        let (a, b, c) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+        let mut ext = extension();
+        ext.add_guard(a, &owner, 100).unwrap();
+        assert!(!ext.is_guard(&a, 100 + DAY));
+        assert!(ext.is_guard(&a, 100 + 2 * DAY));
+        assert!(ext.add_guard(a, &owner, 100).is_err()); // duplicate
+        assert!(ext.add_guard(owner, &owner, 100).is_err()); // the owner itself
+        ext.add_guard(b, &owner, 100).unwrap();
+        assert!(ext.add_guard(c, &owner, 100).is_err()); // a third
+    }
+
+    #[test]
+    fn removing_an_active_guard_waits_while_a_waiting_one_goes_at_once() {
+        let owner = Pubkey::new_unique();
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut ext = extension();
+        ext.add_guard(a, &owner, 0).unwrap();
+        ext.remove_guard(&a, 3 * DAY).unwrap();
+        assert!(ext.is_guard(&a, 3 * DAY)); // still active while queued
+        assert!(ext.finalize_guard_removal(&a, 4 * DAY).is_err());
+        ext.finalize_guard_removal(&a, 5 * DAY).unwrap();
+        assert!(!ext.is_guard(&a, 5 * DAY));
+
+        ext.add_guard(b, &owner, 10 * DAY).unwrap();
+        ext.remove_guard(&b, 10 * DAY).unwrap();
+        assert!(ext.guard_index(&b).is_none());
+    }
+
+    #[test]
+    fn a_guard_may_drop_only_a_waiting_guard() {
+        let owner = Pubkey::new_unique();
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut ext = extension();
+        ext.add_guard(a, &owner, 0).unwrap();
+        ext.add_guard(b, &owner, 3 * DAY).unwrap();
+        assert!(ext.drop_pending_guard(&a, 3 * DAY).is_err()); // active
+        ext.drop_pending_guard(&b, 3 * DAY).unwrap();
+        assert!(ext.guard_index(&b).is_none());
+    }
+
+    #[test]
+    fn lock_cancels_queued_changes_and_waiting_guards_and_extends_when_repeated() {
+        let owner = Pubkey::new_unique();
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut ext = extension();
+        ext.add_guard(a, &owner, 0).unwrap();
+        ext.add_guard(b, &owner, 5 * DAY).unwrap();
+        ext.pending[PARAM_POLICY_DELAY as usize] = PendingParamChange { new_value: DAY, effective_at: 9 * DAY, exists: true };
+        ext.lock(5 * DAY);
+        assert!(ext.locked);
+        assert_eq!(ext.unlock_after, 5 * DAY + DEFAULT_LOCK_DELAY);
+        assert!(!ext.pending[PARAM_POLICY_DELAY as usize].exists);
+        assert!(ext.guard_index(&b).is_none());
+        assert!(ext.is_guard(&a, 5 * DAY));
+        ext.lock(8 * DAY);
+        assert_eq!(ext.unlock_after, 8 * DAY + DEFAULT_LOCK_DELAY);
+        assert_eq!(ext.lock_epoch, 1);
+    }
+
+    #[test]
+    fn unlock_only_after_the_lock_delay() {
+        let mut ext = extension();
+        assert!(ext.unlock(0).is_err()); // not locked
+        ext.lock(0);
+        assert!(ext.unlock(DEFAULT_LOCK_DELAY - 1).is_err());
+        ext.unlock(DEFAULT_LOCK_DELAY).unwrap();
+        assert!(!ext.locked);
+    }
+
+    #[test]
+    fn a_lock_voids_requests_and_waiting_destinations_but_not_active_ones() {
+        let mut ext = extension();
+        let active = entry(&ext, 10);
+        let waiting = entry(&ext, 50);
+        let request = WithdrawalRequest {
+            extension: Pubkey::new_unique(), id: 0, to: Pubkey::new_unique(), mint: None, amount: 1,
+            available_at: 30, expires_at: 40, epoch_at_request: 0, executed: false, cancelled: false, bump: 0,
+            lock_epoch_at_request: ext.lock_epoch,
+        };
+        ext.lock(20);
+        assert!(request.is_annulled(&ext));
+        assert!(request.is_terminal(20, &ext) && request.retention_satisfied(20, &ext));
+        assert!(active.is_active(&ext, 60));
+        assert!(!waiting.is_active(&ext, 60));
+        ext.unlock(20 + DEFAULT_LOCK_DELAY).unwrap();
+        assert!(!waiting.is_active(&ext, 20 + DEFAULT_LOCK_DELAY));
+        // Added after the lock: unaffected by it.
+        let fresh = entry(&ext, 30 + DEFAULT_LOCK_DELAY);
+        assert!(fresh.is_active(&ext, 30 + DEFAULT_LOCK_DELAY));
+    }
+
+    #[test]
+    fn a_destination_from_before_the_kept_lock_history_counts_as_voided() {
+        let mut ext = extension();
+        let old = entry(&ext, 10);
+        for i in 0..LOCK_HISTORY as i64 {
+            let t = 100 + i * 2 * DEFAULT_LOCK_DELAY;
+            ext.lock(t);
+            ext.unlock(t + DEFAULT_LOCK_DELAY).unwrap();
+        }
+        // Still within the kept history: the first lock came after it was active.
+        assert!(old.is_active(&ext, 10_000_000));
+        ext.lock(10_000_000);
+        // One lock too many: we no longer know, so it must be added again.
+        assert!(!old.is_active(&ext, 10_000_001));
     }
 }

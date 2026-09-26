@@ -24,9 +24,22 @@ interface IAvelockWallet {
 ///      those parameters (threat-model section 13), and immutable floors
 ///      on withdrawalDelay/addressDelay that no owner action — not even a
 ///      policy-delayed one — can ever go below (threat-model section 14).
+///
+///      Guard keys and Panic Lock (FEATURE_PLANS.md, B1/B2; `features()`
+///      bit 0). A guard can only stop things: cancel, lock. It can never
+///      move funds, add a destination or a guard, change settings or
+///      unlock. Locking is instant; unlocking waits `lockDelay`. The trust
+///      model is still v0 (the phrase is the owner), hence version 0.
 contract AvelockSecurityExtension is IExtension {
+    /// @notice Bit 0: guard keys and Panic Lock.
+    uint256 public constant FEATURE_GUARDS_AND_LOCK = 1;
+
     function protocolVersion() external pure returns (uint256) {
         return 0;
+    }
+
+    function features() external pure returns (uint256) {
+        return FEATURE_GUARDS_AND_LOCK;
     }
 
     uint256 public constant MAX_DELAY = 90 days;
@@ -35,12 +48,22 @@ contract AvelockSecurityExtension is IExtension {
     ///      before it can be pruned — bounds unbounded storage growth
     ///      from years of use without erasing recent history.
     uint256 public constant REQUEST_RETENTION = 182 days;
+    uint256 public constant MAX_GUARDS = 2;
+    /// @dev Default wait before an owner can lift a Panic Lock (at least the withdrawal delay).
+    uint256 public constant DEFAULT_LOCK_DELAY = 7 days;
 
     enum Param {
         WithdrawalDelay,
         AddressDelay,
         ConfirmationWindow,
-        PolicyDelay
+        PolicyDelay,
+        LockDelay
+    }
+
+    struct Guard {
+        address key;
+        uint64 activeAt; // usable from this time (added keys wait addressDelay)
+        uint64 removableAt; // 0 = no removal queued
     }
 
     struct PendingParamChange {
@@ -92,6 +115,19 @@ contract AvelockSecurityExtension is IExtension {
     mapping(uint256 => uint8) public assetKind;
     mapping(uint256 => uint256) public tokenId;
 
+    // ---- Guard keys and Panic Lock (version 1) ----
+    Guard[2] internal guardSlots;
+    uint256 public lockDelay;
+    bool public locked;
+    /// @dev The owner may unlock from this time on (while `locked`).
+    uint256 public unlockAfter;
+    /// @dev Bumped by every lock; requests and pending allowlist entries from
+    ///      before a lock can no longer be used.
+    uint256 public lockEpoch;
+    mapping(uint256 => uint256) public lockTimeOfEpoch;
+    mapping(uint256 => uint256) public requestLockEpoch;
+    mapping(address => uint256) public allowlistLockEpoch;
+
     event AddressAdded(address indexed destination, uint256 activeAt);
     event AddressRemoved(address indexed destination);
     event WithdrawalRequested(
@@ -108,6 +144,12 @@ contract AvelockSecurityExtension is IExtension {
     event ParamChangeQueued(Param indexed param, uint256 newValue, uint256 effectiveAt);
     event ParamChangeCancelled(Param indexed param);
     event RequestPruned(uint256 indexed requestId);
+    event GuardAdded(address indexed key, uint256 activeAt);
+    event GuardRemovalQueued(address indexed key, uint256 removableAt);
+    event GuardRemovalCancelled(address indexed key);
+    event GuardRemoved(address indexed key);
+    event Locked(address indexed by, uint256 unlockAfter);
+    event Unlocked();
 
     error OwnerRotationDisabled();
     error InvalidParameter();
@@ -124,9 +166,28 @@ contract AvelockSecurityExtension is IExtension {
     error BelowImmutableMinimum();
     error Erc20TransferFailed();
     error AlreadyInitialized();
+    error VaultLocked();
+    error NotLocked();
+    error LockNotExpired();
+    error TooManyGuards();
+    error GuardNotFound();
+    error GuardExists();
+    error RequestAnnulled();
+    error NotPending();
 
     modifier onlyOwner() {
         if (msg.sender != IAvelockWallet(walletAddress).owner()) revert NotOwner();
+        _;
+    }
+
+    /// @dev The owner, or an active guard key (stop-only actions).
+    modifier onlyOwnerOrGuard() {
+        if (msg.sender != IAvelockWallet(walletAddress).owner() && !isGuard(msg.sender)) revert NotOwner();
+        _;
+    }
+
+    modifier whenUnlocked() {
+        if (locked) revert VaultLocked();
         _;
     }
 
@@ -158,6 +219,8 @@ contract AvelockSecurityExtension is IExtension {
         _validate(Param.ConfirmationWindow, _confirmationWindow);
         _validate(Param.PolicyDelay, _policyDelay);
         walletAddress = _wallet;
+        // Lifting a lock waits at least as long as a withdrawal would.
+        lockDelay = _withdrawalDelay > DEFAULT_LOCK_DELAY ? _withdrawalDelay : DEFAULT_LOCK_DELAY;
         withdrawalDelay = _withdrawalDelay;
         addressDelay = _addressDelay;
         confirmationWindow = _confirmationWindow;
@@ -174,37 +237,46 @@ contract AvelockSecurityExtension is IExtension {
     // All policy changes are delayed, including increases that can harm availability.
     // ---------------------------------------------------------------
 
-    function setWithdrawalDelay(uint256 newValue) external onlyOwner {
+    function setWithdrawalDelay(uint256 newValue) external onlyOwner whenUnlocked {
         if (newValue < minWithdrawalDelay) revert BelowImmutableMinimum();
         _proposeChange(Param.WithdrawalDelay, newValue, withdrawalDelay);
     }
 
-    function setAddressDelay(uint256 newValue) external onlyOwner {
+    function setAddressDelay(uint256 newValue) external onlyOwner whenUnlocked {
         if (newValue < minAddressDelay) revert BelowImmutableMinimum();
         _proposeChange(Param.AddressDelay, newValue, addressDelay);
     }
 
-    function setConfirmationWindow(uint256 newValue) external onlyOwner {
+    function setConfirmationWindow(uint256 newValue) external onlyOwner whenUnlocked {
         _proposeChange(Param.ConfirmationWindow, newValue, confirmationWindow);
     }
 
-    function setPolicyDelay(uint256 newValue) external onlyOwner {
+    function setPolicyDelay(uint256 newValue) external onlyOwner whenUnlocked {
         _proposeChange(Param.PolicyDelay, newValue, policyDelay);
     }
 
+    /// @notice The wait before a Panic Lock can be lifted; never below the withdrawal delay floor.
+    function setLockDelay(uint256 newValue) external onlyOwner whenUnlocked {
+        if (newValue < minWithdrawalDelay) revert BelowImmutableMinimum();
+        _proposeChange(Param.LockDelay, newValue, lockDelay);
+    }
+
     /// @notice Finalize a bounded parameter change after the old policy delay.
-    function applyParamChange(Param param) external onlyOwner {
+    function applyParamChange(Param param) external onlyOwner whenUnlocked {
         PendingParamChange storage p = pendingParamChanges[param];
         if (!p.exists) revert NoPendingChange();
         if (block.timestamp < p.effectiveAt) revert ChangeNotReady();
 
-        _writeParam(param, p.newValue);
+        // Copy before the delete: `p` is a storage reference, so after it the
+        // event would carry 0 instead of the applied value (AVL-EVM-001).
+        uint256 newValue = p.newValue;
+        _writeParam(param, newValue);
         delete pendingParamChanges[param];
-        emit ParamChangeApplied(param, p.newValue);
+        emit ParamChangeApplied(param, newValue);
     }
 
-    /// @notice Cancel a queued parameter change before it takes effect.
-    function cancelParamChange(Param param) external onlyOwner {
+    /// @notice Cancel a queued parameter change before it takes effect (owner or guard).
+    function cancelParamChange(Param param) external onlyOwnerOrGuard {
         if (!pendingParamChanges[param].exists) revert NoPendingChange();
         delete pendingParamChanges[param];
         emit ParamChangeCancelled(param);
@@ -225,7 +297,15 @@ contract AvelockSecurityExtension is IExtension {
     /// @dev Every actual parameter change waits under the current policy, including increases.
     function _proposeChange(Param param, uint256 newValue, uint256 currentValue) internal {
         _validate(param, newValue);
-        if (newValue == currentValue) return;
+        // Re-setting the current value withdraws any queued change for this
+        // parameter, so an old pending weakening cannot survive it (audit M-1).
+        if (newValue == currentValue) {
+            if (pendingParamChanges[param].exists) {
+                delete pendingParamChanges[param];
+                emit ParamChangeCancelled(param);
+            }
+            return;
+        }
         uint256 effectiveAt = block.timestamp + policyDelay;
         pendingParamChanges[param] = PendingParamChange(newValue, effectiveAt, true);
         emit ParamChangeQueued(param, newValue, effectiveAt);
@@ -238,8 +318,10 @@ contract AvelockSecurityExtension is IExtension {
             addressDelay = value;
         } else if (param == Param.ConfirmationWindow) {
             confirmationWindow = value;
-        } else {
+        } else if (param == Param.PolicyDelay) {
             policyDelay = value;
+        } else {
+            lockDelay = value;
         }
     }
 
@@ -248,12 +330,25 @@ contract AvelockSecurityExtension is IExtension {
     // strengthening action (immediate). See threat-model section 8.
     // ---------------------------------------------------------------
 
-    function addAllowedAddress(address destination) external onlyOwner {
+    function addAllowedAddress(address destination) external onlyOwner whenUnlocked {
         if (destination == address(0)) revert ZeroAddress();
-        if (allowlistActiveAt[destination] != 0) return;
+        if (allowlistActiveAt[destination] != 0) {
+            // An entry voided by a lock may be added again (and waits again).
+            if (!_voidedByLock(destination)) return;
+            allowlistEpoch[destination]++;
+        }
         uint256 activeAt = block.timestamp + addressDelay;
         allowlistActiveAt[destination] = activeAt;
+        allowlistLockEpoch[destination] = lockEpoch;
         emit AddressAdded(destination, activeAt);
+    }
+
+    /// @notice Stop a destination that is still waiting to become usable (owner or guard).
+    function cancelPendingAddress(address destination) external onlyOwnerOrGuard {
+        if (allowlistActiveAt[destination] <= block.timestamp) revert NotPending();
+        allowlistEpoch[destination]++;
+        delete allowlistActiveAt[destination];
+        emit AddressRemoved(destination);
     }
 
     function removeAllowedAddress(address destination) external onlyOwner {
@@ -264,7 +359,14 @@ contract AvelockSecurityExtension is IExtension {
 
     function isAddressActive(address destination) public view returns (bool) {
         uint256 activeAt = allowlistActiveAt[destination];
-        return activeAt != 0 && block.timestamp >= activeAt;
+        return activeAt != 0 && block.timestamp >= activeAt && !_voidedByLock(destination);
+    }
+
+    /// @dev An entry still waiting when the first lock after it came is void:
+    ///      a lock stops every pending change, new destinations included.
+    function _voidedByLock(address destination) internal view returns (bool) {
+        uint256 lockedAt = lockTimeOfEpoch[allowlistLockEpoch[destination] + 1];
+        return lockedAt != 0 && lockedAt < allowlistActiveAt[destination];
     }
 
     // ---------------------------------------------------------------
@@ -274,6 +376,7 @@ contract AvelockSecurityExtension is IExtension {
     function requestWithdrawal(address to, address token, uint256 amount)
         external
         onlyOwner
+        whenUnlocked
         returns (uint256 requestId)
     {
         return _request(to, token, amount, 0, 0);
@@ -282,6 +385,7 @@ contract AvelockSecurityExtension is IExtension {
     function requestNFTWithdrawal(address to, address token, uint256 id, uint256 amount, bool is1155)
         external
         onlyOwner
+        whenUnlocked
         returns (uint256)
     {
         if (token == address(0) || (!is1155 && amount != 1)) revert InvalidAsset();
@@ -297,6 +401,7 @@ contract AvelockSecurityExtension is IExtension {
 
         requestId = nextRequestId++;
         requestEpoch[requestId] = allowlistEpoch[to];
+        requestLockEpoch[requestId] = lockEpoch;
         assetKind[requestId] = kind;
         tokenId[requestId] = id;
         uint256 availableAt = block.timestamp + withdrawalDelay;
@@ -315,8 +420,8 @@ contract AvelockSecurityExtension is IExtension {
         emit WithdrawalRequested(requestId, to, token, amount, availableAt, expiresAt);
     }
 
-    /// @notice Cancel a pending request at any time before execution.
-    function cancelWithdrawal(uint256 requestId) external onlyOwner {
+    /// @notice Cancel a pending request at any time before execution (owner or guard).
+    function cancelWithdrawal(uint256 requestId) external onlyOwnerOrGuard {
         WithdrawalRequest storage r = requests[requestId];
         if (r.to == address(0) && r.amount == 0 && r.availableAt == 0) revert RequestNotFound();
         if (r.executed || r.cancelled) revert RequestAlreadyFinal();
@@ -328,10 +433,11 @@ contract AvelockSecurityExtension is IExtension {
     /// @notice Final confirmation after the timelock has elapsed. This is
     ///         a second, separate owner action — the timelock never
     ///         auto-executes (threat-model section 10).
-    function confirmWithdrawal(uint256 requestId) external onlyOwner {
+    function confirmWithdrawal(uint256 requestId) external onlyOwner whenUnlocked {
         WithdrawalRequest storage r = requests[requestId];
         if (r.to == address(0) && r.amount == 0 && r.availableAt == 0) revert RequestNotFound();
         if (r.executed || r.cancelled) revert RequestAlreadyFinal();
+        if (requestLockEpoch[requestId] != lockEpoch) revert RequestAnnulled();
         if (block.timestamp < r.availableAt) revert RequestNotReady();
         if (block.timestamp > r.expiresAt) revert RequestExpired();
 
@@ -362,19 +468,29 @@ contract AvelockSecurityExtension is IExtension {
         address callTarget = r.token == address(0) ? r.to : r.token;
         uint256 callValue = r.token == address(0) ? r.amount : 0;
 
+        bool isErc20 = kind == 0 && r.token != address(0);
+        uint256 balanceBefore = isErc20 ? _tokenBalance(r.token, walletAddress) : 0;
+
         emit WithdrawalExecuted(requestId);
         bytes memory returndata = IAvelockWallet(walletAddress).executeFromExtension(callTarget, callValue, data);
 
-        // Some ERC-20s (e.g. threat-model section 50: "tokens that return
-        // false") signal failure via a bool return instead of reverting.
-        // A plain low-level call treats that as success, so we decode and
-        // check it ourselves — reverting here unwinds the whole tx,
-        // including the token call, since nothing has been persisted
-        // externally yet.
-        if (kind == 0 && r.token != address(0) && returndata.length > 0) {
-            bool success = abi.decode(returndata, (bool));
-            if (!success) revert Erc20TransferFailed();
+        // Tokens signal the result three ways: revert, `false`, or nothing.
+        // Tether on TRON returns `false` even on success (audit H-5), so a
+        // `false`/empty return is accepted only when the Vault's balance
+        // actually dropped by the requested amount. `true` is trusted as-is.
+        if (isErc20) {
+            bool returnedTrue = returndata.length >= 32 && abi.decode(returndata, (bool));
+            if (!returnedTrue) {
+                uint256 balanceAfter = _tokenBalance(r.token, walletAddress);
+                if (balanceAfter > balanceBefore || balanceBefore - balanceAfter != r.amount) revert Erc20TransferFailed();
+            }
         }
+    }
+
+    function _tokenBalance(address token, address holder) private view returns (uint256) {
+        (bool ok, bytes memory out) = token.staticcall(abi.encodeWithSignature("balanceOf(address)", holder));
+        if (!ok || out.length < 32) revert Erc20TransferFailed();
+        return abi.decode(out, (uint256));
     }
 
     /// @notice Remove a terminal request's storage once it has aged past
@@ -389,14 +505,137 @@ contract AvelockSecurityExtension is IExtension {
         // immediately. An executed (settled) or expired-unconfirmed one
         // waits out the retention window first, so a completed
         // withdrawal's record stays available for audit for a while.
-        bool terminal = r.executed || r.cancelled || block.timestamp > r.expiresAt;
-        bool retentionOk = r.cancelled || block.timestamp > r.expiresAt + REQUEST_RETENTION;
+        bool annulled = requestLockEpoch[requestId] != lockEpoch && !r.executed;
+        bool terminal = r.executed || r.cancelled || annulled || block.timestamp > r.expiresAt;
+        bool retentionOk = r.cancelled || annulled || block.timestamp > r.expiresAt + REQUEST_RETENTION;
         if (!terminal || !retentionOk) revert RequestNotReady();
 
         delete requests[requestId];
         delete requestEpoch[requestId];
         delete assetKind[requestId];
         delete tokenId[requestId];
+        delete requestLockEpoch[requestId];
         emit RequestPruned(requestId);
+    }
+
+    /// @notice True when a lock after its creation voided the request.
+    function isRequestAnnulled(uint256 requestId) external view returns (bool) {
+        return requestLockEpoch[requestId] != lockEpoch && !requests[requestId].executed;
+    }
+
+    // ---------------------------------------------------------------
+    // Guard keys: stop-only second keys (old phone, hardware key).
+    // Adding and removing both wait addressDelay, so a stolen owner key
+    // cannot quietly swap them; a guard cannot cancel its own removal.
+    // ---------------------------------------------------------------
+
+    function isGuard(address key) public view returns (bool) {
+        if (key == address(0)) return false;
+        for (uint256 i; i < MAX_GUARDS; i++) {
+            Guard storage g = guardSlots[i];
+            if (g.key == key) return block.timestamp >= g.activeAt;
+        }
+        return false;
+    }
+
+    function guards() external view returns (Guard[2] memory) {
+        return guardSlots;
+    }
+
+    function addGuard(address key) external onlyOwner whenUnlocked {
+        if (key == address(0)) revert ZeroAddress();
+        if (key == IAvelockWallet(walletAddress).owner()) revert InvalidParameter();
+        uint256 free = MAX_GUARDS;
+        for (uint256 i; i < MAX_GUARDS; i++) {
+            if (guardSlots[i].key == key) revert GuardExists();
+            if (guardSlots[i].key == address(0) && free == MAX_GUARDS) free = i;
+        }
+        if (free == MAX_GUARDS) revert TooManyGuards();
+        uint256 activeAt = block.timestamp + addressDelay;
+        guardSlots[free] = Guard(key, uint64(activeAt), 0);
+        emit GuardAdded(key, activeAt);
+    }
+
+    /// @notice A guard still waiting to become active is dropped at once
+    ///         (owner or guard); an active one is queued for removal.
+    function removeGuard(address key) external {
+        uint256 i = _guardIndex(key);
+        Guard storage g = guardSlots[i];
+        bool owner = msg.sender == IAvelockWallet(walletAddress).owner();
+        if (block.timestamp < g.activeAt) {
+            if (!owner && !isGuard(msg.sender)) revert NotOwner();
+            delete guardSlots[i];
+            emit GuardRemoved(key);
+            return;
+        }
+        if (!owner) revert NotOwner();
+        if (g.removableAt != 0) return;
+        uint256 removableAt = block.timestamp + addressDelay;
+        g.removableAt = uint64(removableAt);
+        emit GuardRemovalQueued(key, removableAt);
+    }
+
+    function cancelGuardRemoval(address key) external onlyOwner {
+        Guard storage g = guardSlots[_guardIndex(key)];
+        if (g.removableAt == 0) revert NotPending();
+        g.removableAt = 0;
+        emit GuardRemovalCancelled(key);
+    }
+
+    function finalizeGuardRemoval(address key) external onlyOwner {
+        uint256 i = _guardIndex(key);
+        uint256 removableAt = guardSlots[i].removableAt;
+        if (removableAt == 0) revert NotPending();
+        if (block.timestamp < removableAt) revert ChangeNotReady();
+        delete guardSlots[i];
+        emit GuardRemoved(key);
+    }
+
+    function _guardIndex(address key) internal view returns (uint256) {
+        if (key != address(0)) {
+            for (uint256 i; i < MAX_GUARDS; i++) if (guardSlots[i].key == key) return i;
+        }
+        revert GuardNotFound();
+    }
+
+    // ---------------------------------------------------------------
+    // Panic Lock: instant to set (owner or guard), slow to lift.
+    // Locking voids every pending request, queued setting change,
+    // pending guard and pending destination. Locking again extends it.
+    // ---------------------------------------------------------------
+
+    function lock() external onlyOwnerOrGuard {
+        uint256 until = block.timestamp + lockDelay;
+        if (locked) {
+            if (until > unlockAfter) unlockAfter = until;
+            emit Locked(msg.sender, unlockAfter);
+            return;
+        }
+        locked = true;
+        unlockAfter = until;
+        lockEpoch++;
+        lockTimeOfEpoch[lockEpoch] = block.timestamp;
+        for (uint256 p; p <= uint256(Param.LockDelay); p++) {
+            if (pendingParamChanges[Param(p)].exists) {
+                delete pendingParamChanges[Param(p)];
+                emit ParamChangeCancelled(Param(p));
+            }
+        }
+        for (uint256 i; i < MAX_GUARDS; i++) {
+            Guard storage g = guardSlots[i];
+            if (g.key != address(0) && block.timestamp < g.activeAt) {
+                emit GuardRemoved(g.key);
+                delete guardSlots[i];
+            }
+        }
+        emit Locked(msg.sender, until);
+    }
+
+    /// @notice Only the owner lifts a lock, and only after `unlockAfter`.
+    function unlock() external onlyOwner {
+        if (!locked) revert NotLocked();
+        if (block.timestamp < unlockAfter) revert LockNotExpired();
+        locked = false;
+        emit Unlocked();
     }
 }

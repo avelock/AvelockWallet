@@ -36,4 +36,22 @@ pub enum AvelockError {
     ArithmeticOverflow,
     #[msg("The Vault cannot be its own native withdrawal destination.")]
     InvalidDestination,
+    #[msg("The Vault is locked.")]
+    VaultLocked,
+    #[msg("The Vault is not locked.")]
+    NotLocked,
+    #[msg("The lock cannot be lifted yet.")]
+    LockNotExpired,
+    #[msg("A Vault has at most two guard keys.")]
+    TooManyGuards,
+    #[msg("This guard key is already added.")]
+    GuardExists,
+    #[msg("No such guard key.")]
+    GuardNotFound,
+    #[msg("Only an active guard key can do this.")]
+    NotGuard,
+    #[msg("Nothing is waiting here.")]
+    NotPending,
+    #[msg("A lock after this request voided it.")]
+    RequestAnnulled,
 }

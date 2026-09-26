@@ -96,7 +96,7 @@ contract AvelockWallet {
         });
     }
 
-    get fun protocolVersion(): Int { return 0; }
+    get fun protocolVersion(): Int { return 1; }
     get fun networkGlobalId(): Int { return self.networkGlobalId; }
 
     get fun seqno(): Int {

@@ -4,7 +4,7 @@ Test network: **Devnet** · explorer: https://explorer.solana.com/?cluster=devne
 
 **Source:** [`contracts/solana`](../../contracts/solana) — an Anchor program.
 
-**Status: not deployed yet.** The program id declared in the source is
+**Status: deployed on Devnet, still upgradeable.** Program id
 `9r172eBe2XJ9PPFH8rmb6XbxNkrNLkMnqBZmSfCwUiXD`. Before any Vault holds real
 value, the deployed program must be made immutable (no upgrade authority) and
 checked against a reviewed build of this source.

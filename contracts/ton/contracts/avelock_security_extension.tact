@@ -39,6 +39,29 @@ message WithdrawalFailed {
     requestId: Int as uint64;
 }
 
+// Guard keys (FEATURE_PLANS.md, B1) are ordinary TON wallets: they act by
+// internal message and pay their own fees, so a stolen guard cannot spend
+// this module's fee balance. Any value they attach tops that balance up.
+// A guard can only stop things; it never moves funds or unlocks.
+message(0x47554101) GuardCancelWithdrawal {
+    requestId: Int as uint64;
+}
+message(0x47554102) GuardCancelParamChange {
+    param: Int as uint8;
+}
+message(0x47554103) GuardCancelPendingAddress {
+    destination: Address;
+}
+message(0x47554104) GuardDropPendingGuard {
+    guard: Address;
+}
+message(0x47554105) GuardLock {}
+
+struct GuardState {
+    activeAt: Int as uint32;
+    removableAt: Int as uint32; // 0 = no removal queued
+}
+
 struct WithdrawalRequest {
     to: Address;
     amount: Int as coins;
@@ -100,11 +123,24 @@ const OP_APPLY_OWNER_ROTATION: Int = 14;
 const OP_CANCEL_OWNER_ROTATION: Int = 15;
 const OP_REGISTER_ASSET: Int = 16;
 const OP_REVOKE_ASSET: Int = 17;
+const OP_ADD_GUARD: Int = 18;
+const OP_REMOVE_GUARD: Int = 19;
+const OP_CANCEL_GUARD_REMOVAL: Int = 20;
+const OP_FINALIZE_GUARD_REMOVAL: Int = 21;
+const OP_LOCK: Int = 22;
+const OP_UNLOCK: Int = 23;
+const OP_SET_LOCK_DELAY: Int = 24;
 
 const PARAM_WITHDRAWAL_DELAY: Int = 0;
 const PARAM_ADDRESS_DELAY: Int = 1;
 const PARAM_POLICY_DELAY: Int = 2;
 const PARAM_CONFIRMATION_WINDOW: Int = 3;
+const PARAM_LOCK_DELAY: Int = 4;
+
+const MAX_GUARDS: Int = 2;
+const DEFAULT_LOCK_DELAY: Int = 604800; // 7 days
+// features() bit 0: guard keys and Panic Lock.
+const FEATURE_GUARDS_AND_LOCK: Int = 1;
 
 // Standard TEP-74 jetton transfer opcode.
 const JETTON_TRANSFER_OP: Int = 0x0f8a7ea5;
@@ -157,6 +193,19 @@ contract AvelockSecurityExtension {
     requestIdByOperation: map<Int as uint32, Int as uint64>;
     pendingParamChanges: map<Int as uint8, PendingParamChange>;
 
+    // Guard keys and Panic Lock (FEATURE_PLANS.md, B1/B2).
+    guards: map<Address, GuardState>;
+    lockDelay: Int as uint32;
+    locked: Bool = false;
+    unlockAfter: Int as uint32 = 0;
+    // Bumped by every lock: requests, pending destinations and pending
+    // asset registrations from before a lock can no longer be used.
+    lockEpoch: Int as uint32 = 0;
+    lockTimes: map<Int as uint32, Int as uint32>;
+    requestLockEpoch: map<Int as uint64, Int as uint32>;
+    allowlistLockEpoch: map<Address, Int as uint32>;
+    assetLockEpoch: map<Address, Int as uint32>;
+
     init(
         ownerPublicKey: Int,
         networkGlobalId: Int,
@@ -183,6 +232,9 @@ contract AvelockSecurityExtension {
         self.policyDelay = policyDelay;
         self.minWithdrawalDelay = minWithdrawalDelay;
         self.minAddressDelay = minAddressDelay;
+        // Lifting a lock waits at least as long as a withdrawal would.
+        self.lockDelay = DEFAULT_LOCK_DELAY;
+        if (withdrawalDelay > DEFAULT_LOCK_DELAY) { self.lockDelay = withdrawalDelay; }
         self.nextRequestId = 0;
         self._validate(PARAM_WITHDRAWAL_DELAY, withdrawalDelay);
         self._validate(PARAM_ADDRESS_DELAY, addressDelay);
@@ -218,12 +270,19 @@ contract AvelockSecurityExtension {
         self.seqno += 1;
         try {
         if (op == OP_REGISTER_ASSET) {
+            throwUnless(71, !self.locked);
             let asset: Address = msg.loadAddress();
             let kind: Int = msg.loadUint(2);
             let rootAddress: Address = msg.loadRef().beginParse().loadAddress();
             throwUnless(61, kind == ASSET_JETTON || kind == ASSET_NFT);
             let existing: AssetRegistration? = self.registeredAssets.get(asset);
+            if (existing != null && self._voidedByLock(self.assetLockEpoch.get(asset), existing!!.activeAt)) {
+                // Voided by a lock while still waiting: register again, wait again.
+                self.assetEpochs.set(asset, self.assetEpoch(asset) + 1);
+                existing = null;
+            }
             if (existing == null) {
+                self.assetLockEpoch.set(asset, self.lockEpoch);
                 // This target receives real TON fees. Client getter checks are
                 // not proofs, so never shorten the old destination protection.
                 let delay: Int = self.policyDelay;
@@ -240,15 +299,23 @@ contract AvelockSecurityExtension {
             self.assetEpochs.set(asset, self.assetEpoch(asset) + 1);
             self.registeredAssets.set(asset, null);
         } else if (op == OP_ADD_ALLOWED_ADDRESS) {
+            throwUnless(71, !self.locked);
             let destination: Address = msg.loadAddress();
-            if (self.allowlistActiveAt.get(destination) == null) {
+            let current: Int? = self.allowlistActiveAt.get(destination);
+            if (current != null && self._voidedByLock(self.allowlistLockEpoch.get(destination), current!!)) {
+                self.allowlistEpoch.set(destination, self.epoch(destination) + 1);
+                current = null;
+            }
+            if (current == null) {
                 self.allowlistActiveAt.set(destination, now() + self.addressDelay);
+                self.allowlistLockEpoch.set(destination, self.lockEpoch);
             }
         } else if (op == OP_REMOVE_ALLOWED_ADDRESS) {
             let destination: Address = msg.loadAddress();
             self.allowlistEpoch.set(destination, self.epoch(destination) + 1);
             self.allowlistActiveAt.set(destination, null);
         } else if (op == OP_REQUEST_WITHDRAWAL) {
+            throwUnless(71, !self.locked);
             let to: Address = msg.loadAddress();
             let amount: Int = msg.loadCoins();
             // Keep the optional asset address in a reference so the signed
@@ -271,6 +338,11 @@ contract AvelockSecurityExtension {
                 // arbitrary message bodies to allowlisted contracts, and no
                 // unbounded storage in request records.
                 throwUnless(69, c.bits() >= 32 && c.loadUint(32) == 0 && c.refs() == 0);
+                // A bounce is matched to its request by the 64 bits after the
+                // op (audit M-2). Request ids never reach 2^56, so text that
+                // starts with a non-zero byte can never be read as one — and a
+                // text comment has no reason to start with a NUL.
+                throwUnless(69, c.bits() == 0 || c.preloadUint(8) != 0);
             }
             let bounceable: Bool = msg.loadBool();
             // Non-bounceable delivery is only meaningful for native TON.
@@ -278,6 +350,7 @@ contract AvelockSecurityExtension {
             throwUnless(61, assetKind <= ASSET_NFT && (assetKind == ASSET_NFT || amount > 0));
             throwUnless(52, self.isAddressActive(to));
             self.requestEpoch.set(self.nextRequestId, self.epoch(to));
+            self.requestLockEpoch.set(self.nextRequestId, self.lockEpoch);
             let asset: Address? = jettonWallet;
             if (nftItemAddress != null) { asset = nftItemAddress; }
             if (asset != null) {
@@ -314,8 +387,9 @@ contract AvelockSecurityExtension {
             // reporting ends; archived IDs can never be submitted again.
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
-            let terminal: Bool = req.cancelled || req.submitted || now() > req.expiresAt;
-            let retentionOk: Bool = req.cancelled || now() > req.expiresAt + REQUEST_RETENTION;
+            let annulled: Bool = self.isRequestAnnulled(requestId);
+            let terminal: Bool = req.cancelled || req.submitted || annulled || now() > req.expiresAt;
+            let retentionOk: Bool = req.cancelled || annulled || now() > req.expiresAt + REQUEST_RETENTION;
             throwUnless(66, terminal && retentionOk);
             if (req.submitted) {
                 send(SendParameters{
@@ -329,11 +403,14 @@ contract AvelockSecurityExtension {
             self.requests.set(requestId, null);
             self.requestEpoch.set(requestId, null);
             self.requestAssetEpoch.set(requestId, null);
+            self.requestLockEpoch.set(requestId, null);
         } else if (op == OP_CONFIRM_WITHDRAWAL) {
+            throwUnless(71, !self.locked);
             throwUnless(64, myBalance() >= ton("0.07"));
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
             throwUnless(53, !req.submitted && !req.cancelled);
+            throwUnless(72, !self.isRequestAnnulled(requestId));
             throwUnless(54, now() >= req.availableAt);
             throwUnless(55, now() <= req.expiresAt);
 
@@ -425,20 +502,25 @@ contract AvelockSecurityExtension {
                 });
             }
         } else if (op == OP_SET_WITHDRAWAL_DELAY) {
+            throwUnless(71, !self.locked);
             let newValue: Int = msg.loadUint(32);
             throwUnless(56, newValue >= self.minWithdrawalDelay);
             self._proposeChange(PARAM_WITHDRAWAL_DELAY, newValue, self.withdrawalDelay);
         } else if (op == OP_SET_ADDRESS_DELAY) {
+            throwUnless(71, !self.locked);
             let newValue: Int = msg.loadUint(32);
             throwUnless(57, newValue >= self.minAddressDelay);
             self._proposeChange(PARAM_ADDRESS_DELAY, newValue, self.addressDelay);
         } else if (op == OP_SET_POLICY_DELAY) {
+            throwUnless(71, !self.locked);
             let newValue: Int = msg.loadUint(32);
             self._proposeChange(PARAM_POLICY_DELAY, newValue, self.policyDelay);
         } else if (op == OP_SET_CONFIRMATION_WINDOW) {
+            throwUnless(71, !self.locked);
             let newValue: Int = msg.loadUint(32);
             self._proposeChange(PARAM_CONFIRMATION_WINDOW, newValue, self.confirmationWindow);
         } else if (op == OP_APPLY_PARAM_CHANGE) {
+            throwUnless(71, !self.locked);
             let param: Int = msg.loadUint(8);
             let pending: PendingParamChange = self.pendingParamChanges.get(param)!!;
             throwUnless(58, pending.exists);
@@ -450,6 +532,42 @@ contract AvelockSecurityExtension {
             let pending: PendingParamChange = self.pendingParamChanges.get(param)!!;
             throwUnless(58, pending.exists);
             self.pendingParamChanges.set(param, null);
+        } else if (op == OP_SET_LOCK_DELAY) {
+            throwUnless(71, !self.locked);
+            let newValue: Int = msg.loadUint(32);
+            throwUnless(56, newValue >= self.minWithdrawalDelay);
+            self._proposeChange(PARAM_LOCK_DELAY, newValue, self.lockDelay);
+        } else if (op == OP_ADD_GUARD) {
+            throwUnless(71, !self.locked);
+            let key: Address = msg.loadAddress();
+            throwUnless(74, self.guards.get(key) == null && self._guardCount() < MAX_GUARDS);
+            self.guards.set(key, GuardState{ activeAt: now() + self.addressDelay, removableAt: 0 });
+        } else if (op == OP_REMOVE_GUARD) {
+            // A guard still waiting goes at once; an active one waits the
+            // address delay, so a stolen owner key can't quietly drop it.
+            let key: Address = msg.loadAddress();
+            let g: GuardState = self.guards.get(key)!!;
+            if (now() < g.activeAt) {
+                self.guards.set(key, null);
+            } else if (g.removableAt == 0) {
+                self.guards.set(key, GuardState{ activeAt: g.activeAt, removableAt: now() + self.addressDelay });
+            }
+        } else if (op == OP_CANCEL_GUARD_REMOVAL) {
+            let key: Address = msg.loadAddress();
+            let g: GuardState = self.guards.get(key)!!;
+            throwUnless(75, g.removableAt != 0);
+            self.guards.set(key, GuardState{ activeAt: g.activeAt, removableAt: 0 });
+        } else if (op == OP_FINALIZE_GUARD_REMOVAL) {
+            let key: Address = msg.loadAddress();
+            let g: GuardState = self.guards.get(key)!!;
+            throwUnless(75, g.removableAt != 0);
+            throwUnless(59, now() >= g.removableAt);
+            self.guards.set(key, null);
+        } else if (op == OP_LOCK) {
+            self._lock();
+        } else if (op == OP_UNLOCK) {
+            throwUnless(73, self.locked && now() >= self.unlockAfter);
+            self.locked = false;
         } else {
             throw(60);
         }
@@ -469,6 +587,98 @@ contract AvelockSecurityExtension {
         req.failed = true;
         // Do not automatically retry an asynchronous asset transfer.
         self.requests.set(msg.requestId, req);
+    }
+
+    // ---- guard actions: stop-only, by internal message from a guard wallet ----
+
+    receive(msg: GuardCancelWithdrawal) {
+        throwUnless(76, self.isGuard(sender()));
+        let req: WithdrawalRequest = self.requests.get(msg.requestId)!!;
+        throwUnless(53, !req.submitted && !req.cancelled);
+        req.cancelled = true;
+        self.requests.set(msg.requestId, req);
+    }
+
+    receive(msg: GuardCancelParamChange) {
+        throwUnless(76, self.isGuard(sender()));
+        throwUnless(58, self.pendingParamChanges.get(msg.param) != null);
+        self.pendingParamChanges.set(msg.param, null);
+    }
+
+    receive(msg: GuardCancelPendingAddress) {
+        throwUnless(76, self.isGuard(sender()));
+        let activeAt: Int? = self.allowlistActiveAt.get(msg.destination);
+        throwUnless(75, activeAt != null && now() < activeAt!!);
+        self.allowlistEpoch.set(msg.destination, self.epoch(msg.destination) + 1);
+        self.allowlistActiveAt.set(msg.destination, null);
+    }
+
+    receive(msg: GuardDropPendingGuard) {
+        throwUnless(76, self.isGuard(sender()));
+        let g: GuardState = self.guards.get(msg.guard)!!;
+        throwUnless(75, now() < g.activeAt);
+        self.guards.set(msg.guard, null);
+    }
+
+    receive(msg: GuardLock) {
+        throwUnless(76, self.isGuard(sender()));
+        self._lock();
+    }
+
+    // Panic Lock: instant; voids pending requests, destinations and asset
+    // registrations, cancels queued changes and pending guards. Locking
+    // again extends it. Only the owner lifts it, after lockDelay.
+    fun _lock() {
+        let lockedUntil: Int = now() + self.lockDelay;
+        if (self.locked) {
+            if (lockedUntil > self.unlockAfter) { self.unlockAfter = lockedUntil; }
+            return;
+        }
+        self.locked = true;
+        self.unlockAfter = lockedUntil;
+        self.lockEpoch += 1;
+        self.lockTimes.set(self.lockEpoch, now());
+        self.pendingParamChanges = emptyMap();
+        let waiting: map<Address, Bool> = emptyMap();
+        foreach (key, g in self.guards) {
+            if (now() < g.activeAt) { waiting.set(key, true); }
+        }
+        foreach (key, flag in waiting) {
+            self.guards.set(key, null);
+        }
+    }
+
+    fun _guardCount(): Int {
+        let n: Int = 0;
+        foreach (key, g in self.guards) { n += 1; }
+        return n;
+    }
+
+    // Still waiting when the first lock after it came: void.
+    fun _voidedByLock(epoch: Int?, activeAt: Int): Bool {
+        let e: Int = 0;
+        if (epoch != null) { e = epoch!!; }
+        let lockedAt: Int? = self.lockTimes.get(e + 1);
+        return lockedAt != null && lockedAt!! < activeAt;
+    }
+
+    get fun isGuard(addr: Address): Bool {
+        let g: GuardState? = self.guards.get(addr);
+        return g != null && now() >= g!!.activeAt;
+    }
+
+    get fun guards(): map<Address, GuardState> { return self.guards; }
+    get fun locked(): Bool { return self.locked; }
+    get fun unlockAfter(): Int { return self.unlockAfter; }
+    get fun lockEpoch(): Int { return self.lockEpoch; }
+    get fun lockDelay(): Int { return self.lockDelay; }
+    get fun features(): Int { return FEATURE_GUARDS_AND_LOCK; }
+
+    get fun isRequestAnnulled(id: Int): Bool {
+        let e: Int? = self.requestLockEpoch.get(id);
+        if (e == null) { return false; }
+        let req: WithdrawalRequest? = self.requests.get(id);
+        return e!! != self.lockEpoch && (req == null || !req!!.submitted);
     }
 
     get fun lastOperationHash(): Int { return self.lastOperationHash; }
@@ -500,7 +710,7 @@ contract AvelockSecurityExtension {
     get fun isAssetActive(addr: Address, kind: Int): Bool {
         let asset: AssetRegistration? = self.registeredAssets.get(addr);
         if (asset == null) { return false; }
-        return asset!!.kind == kind && now() >= asset!!.activeAt;
+        return asset!!.kind == kind && now() >= asset!!.activeAt && !self._voidedByLock(self.assetLockEpoch.get(addr), asset!!.activeAt);
     }
 
     fun epoch(addr: Address): Int {
@@ -516,7 +726,7 @@ contract AvelockSecurityExtension {
     }
 
     fun _validate(param: Int, value: Int) {
-        throwUnless(61, param >= 0 && param <= PARAM_CONFIRMATION_WINDOW);
+        throwUnless(61, param >= 0 && param <= PARAM_LOCK_DELAY);
         let limit: Int = MAX_DELAY;
         if (param == PARAM_CONFIRMATION_WINDOW) { limit = MAX_CONFIRMATION_WINDOW; }
         throwUnless(61, value > 0 && value <= limit);
@@ -524,7 +734,13 @@ contract AvelockSecurityExtension {
 
     fun _proposeChange(param: Int, newValue: Int, currentValue: Int) {
         self._validate(param, newValue);
-        if (newValue == currentValue) { return; }
+        // Re-setting the current value withdraws a queued change of that
+        // parameter (audit AVL-TON-001): any client, automation or older app
+        // version that "cancels" by setting the current value really cancels.
+        if (newValue == currentValue) {
+            self.pendingParamChanges.set(param, null);
+            return;
+        }
         self.pendingParamChanges.set(param, PendingParamChange{
             newValue: newValue,
             effectiveAt: now() + self.policyDelay,
@@ -539,6 +755,8 @@ contract AvelockSecurityExtension {
             self.addressDelay = value;
         } else if (param == PARAM_CONFIRMATION_WINDOW) {
             self.confirmationWindow = value;
+        } else if (param == PARAM_LOCK_DELAY) {
+            self.lockDelay = value;
         } else {
             self.policyDelay = value;
         }
@@ -555,14 +773,14 @@ contract AvelockSecurityExtension {
         if (activeAt == null) {
             return false;
         }
-        return now() >= activeAt!!;
+        return now() >= activeAt!! && !self._voidedByLock(self.allowlistLockEpoch.get(addr), activeAt!!);
     }
 
     get fun walletAddress(): Address { return self.walletAddress; }
 
     get fun ownerPublicKey(): Int { return self.ownerPublicKey; }
 
-    get fun protocolVersion(): Int { return 0; }
+    get fun protocolVersion(): Int { return 1; }
     get fun networkGlobalId(): Int { return self.networkGlobalId; }
     get fun operationalBalance(): Int { return myBalance(); }
     get fun minimumOperationalBalance(): Int { return ton("0.07"); }

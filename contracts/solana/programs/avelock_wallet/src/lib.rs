@@ -67,6 +67,13 @@ pub mod avelock_wallet {
         extension.next_request_id = 0;
         extension.pending = [PendingParamChange::default(); PARAM_COUNT];
         extension.bump = ctx.bumps.extension;
+        extension.guards = [GuardSlot::default(); MAX_GUARDS];
+        // Lifting a lock waits at least as long as a withdrawal would.
+        extension.lock_delay = withdrawal_delay.max(DEFAULT_LOCK_DELAY);
+        extension.locked = false;
+        extension.unlock_after = 0;
+        extension.lock_epoch = 0;
+        extension.lock_times = [0; LOCK_HISTORY];
 
         emit!(VaultInitialized {
             vault: vault.key(),
@@ -85,29 +92,42 @@ pub mod avelock_wallet {
 
     pub fn set_withdrawal_delay(ctx: Context<OwnerOnly>, new_value: i64) -> Result<()> {
         let extension = &mut ctx.accounts.extension;
+        require!(!extension.locked, AvelockError::VaultLocked);
         require!(new_value >= extension.min_withdrawal_delay, AvelockError::BelowImmutableMinimum);
         propose_change(extension, PARAM_WITHDRAWAL_DELAY, new_value, extension.withdrawal_delay)
     }
 
     pub fn set_address_delay(ctx: Context<OwnerOnly>, new_value: i64) -> Result<()> {
         let extension = &mut ctx.accounts.extension;
+        require!(!extension.locked, AvelockError::VaultLocked);
         require!(new_value >= extension.min_address_delay, AvelockError::BelowImmutableMinimum);
         propose_change(extension, PARAM_ADDRESS_DELAY, new_value, extension.address_delay)
     }
 
     pub fn set_confirmation_window(ctx: Context<OwnerOnly>, new_value: i64) -> Result<()> {
         let extension = &mut ctx.accounts.extension;
+        require!(!extension.locked, AvelockError::VaultLocked);
         propose_change(extension, PARAM_CONFIRMATION_WINDOW, new_value, extension.confirmation_window)
     }
 
     pub fn set_policy_delay(ctx: Context<OwnerOnly>, new_value: i64) -> Result<()> {
         let extension = &mut ctx.accounts.extension;
+        require!(!extension.locked, AvelockError::VaultLocked);
         propose_change(extension, PARAM_POLICY_DELAY, new_value, extension.policy_delay)
+    }
+
+    /// The wait before a Panic Lock can be lifted; never below the withdrawal floor.
+    pub fn set_lock_delay(ctx: Context<OwnerOnly>, new_value: i64) -> Result<()> {
+        let extension = &mut ctx.accounts.extension;
+        require!(!extension.locked, AvelockError::VaultLocked);
+        require!(new_value >= extension.min_withdrawal_delay, AvelockError::BelowImmutableMinimum);
+        propose_change(extension, PARAM_LOCK_DELAY, new_value, extension.lock_delay)
     }
 
     /// Finalize a queued parameter change once its effective time has passed.
     pub fn apply_param_change(ctx: Context<OwnerOnly>, param: u8) -> Result<()> {
         let extension = &mut ctx.accounts.extension;
+        require!(!extension.locked, AvelockError::VaultLocked);
         let idx = param as usize;
         require!(idx < PARAM_COUNT, AvelockError::InvalidParameter);
         let pending = extension.pending[idx];
@@ -141,14 +161,21 @@ pub mod avelock_wallet {
     // ---------------------------------------------------------------
 
     pub fn add_allowed_address(ctx: Context<AddAllowedAddress>) -> Result<()> {
+        let extension = &ctx.accounts.extension;
+        require!(!extension.locked, AvelockError::VaultLocked);
         let entry = &mut ctx.accounts.entry;
         if entry.active_at != 0 {
-            return Ok(()); // Already pending/active — matches the EVM no-op.
+            if !extension.voided_by_lock(entry.lock_epoch_at_add, entry.active_at) {
+                return Ok(()); // Already pending/active — matches the EVM no-op.
+            }
+            // Voided by a lock while it waited: add again, wait again.
+            entry.epoch = entry.epoch.checked_add(1).unwrap();
         }
         let now = Clock::get()?.unix_timestamp;
-        entry.extension = ctx.accounts.extension.key();
+        entry.extension = extension.key();
         entry.destination = ctx.accounts.destination.key();
-        entry.active_at = now + ctx.accounts.extension.address_delay;
+        entry.active_at = now + extension.address_delay;
+        entry.lock_epoch_at_add = extension.lock_epoch;
         entry.bump = ctx.bumps.entry;
         emit!(AddressAdded { extension: entry.extension, destination: entry.destination, active_at: entry.active_at });
         Ok(())
@@ -172,8 +199,9 @@ pub mod avelock_wallet {
 
     pub fn request_native_withdrawal(ctx: Context<RequestWithdrawal>, amount: u64) -> Result<()> {
         require!(amount > 0, AvelockError::ZeroAmount);
+        require!(!ctx.accounts.extension.locked, AvelockError::VaultLocked);
         let now = Clock::get()?.unix_timestamp;
-        require!(ctx.accounts.allowlist.is_active(now), AvelockError::DestinationNotAllowed);
+        require!(ctx.accounts.allowlist.is_active(&ctx.accounts.extension, now), AvelockError::DestinationNotAllowed);
 
         let extension = &mut ctx.accounts.extension;
         let request = &mut ctx.accounts.request;
@@ -185,6 +213,7 @@ pub mod avelock_wallet {
         request.available_at = now + extension.withdrawal_delay;
         request.expires_at = request.available_at + extension.confirmation_window;
         request.epoch_at_request = ctx.accounts.allowlist.epoch;
+        request.lock_epoch_at_request = extension.lock_epoch;
         request.executed = false;
         request.cancelled = false;
         request.bump = ctx.bumps.request;
@@ -204,8 +233,9 @@ pub mod avelock_wallet {
 
     pub fn request_token_withdrawal(ctx: Context<RequestWithdrawal>, amount: u64) -> Result<()> {
         require!(amount > 0, AvelockError::ZeroAmount);
+        require!(!ctx.accounts.extension.locked, AvelockError::VaultLocked);
         let now = Clock::get()?.unix_timestamp;
-        require!(ctx.accounts.allowlist.is_active(now), AvelockError::DestinationNotAllowed);
+        require!(ctx.accounts.allowlist.is_active(&ctx.accounts.extension, now), AvelockError::DestinationNotAllowed);
         let mint = ctx.accounts.mint.as_ref().ok_or(AvelockError::AssetMismatch)?;
 
         let extension = &mut ctx.accounts.extension;
@@ -218,6 +248,7 @@ pub mod avelock_wallet {
         request.available_at = now + extension.withdrawal_delay;
         request.expires_at = request.available_at + extension.confirmation_window;
         request.epoch_at_request = ctx.accounts.allowlist.epoch;
+        request.lock_epoch_at_request = extension.lock_epoch;
         request.executed = false;
         request.cancelled = false;
         request.bump = ctx.bumps.request;
@@ -253,12 +284,15 @@ pub mod avelock_wallet {
         let now = Clock::get()?.unix_timestamp;
         {
             let request = &ctx.accounts.request;
+            let extension = &ctx.accounts.extension;
+            require!(!extension.locked, AvelockError::VaultLocked);
             require!(!request.executed && !request.cancelled, AvelockError::RequestAlreadyFinal);
+            require!(!request.is_annulled(extension), AvelockError::RequestAnnulled);
             require!(now >= request.available_at, AvelockError::RequestNotReady);
             require!(now <= request.expires_at, AvelockError::RequestExpired);
             require!(request.mint.is_none(), AvelockError::NotNativeRequest);
             require!(
-                ctx.accounts.allowlist.is_active(now)
+                ctx.accounts.allowlist.is_active(extension, now)
                     && ctx.accounts.allowlist.epoch == request.epoch_at_request,
                 AvelockError::DestinationNotAllowed
             );
@@ -292,11 +326,14 @@ pub mod avelock_wallet {
         let now = Clock::get()?.unix_timestamp;
         {
             let request = &ctx.accounts.request;
+            let extension = &ctx.accounts.extension;
+            require!(!extension.locked, AvelockError::VaultLocked);
             require!(!request.executed && !request.cancelled, AvelockError::RequestAlreadyFinal);
+            require!(!request.is_annulled(extension), AvelockError::RequestAnnulled);
             require!(now >= request.available_at, AvelockError::RequestNotReady);
             require!(now <= request.expires_at, AvelockError::RequestExpired);
             require!(
-                ctx.accounts.allowlist.is_active(now)
+                ctx.accounts.allowlist.is_active(extension, now)
                     && ctx.accounts.allowlist.epoch == request.epoch_at_request,
                 AvelockError::DestinationNotAllowed
             );
@@ -335,12 +372,130 @@ pub mod avelock_wallet {
     pub fn prune_request(ctx: Context<PruneRequest>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let request = &ctx.accounts.request;
-        require!(request.is_terminal(now), AvelockError::RequestNotPrunable);
-        require!(request.retention_satisfied(now), AvelockError::RequestNotPrunable);
+        let extension = &ctx.accounts.extension;
+        require!(request.is_terminal(now, extension), AvelockError::RequestNotPrunable);
+        require!(request.retention_satisfied(now, extension), AvelockError::RequestNotPrunable);
         emit!(RequestPruned { extension: request.extension, id: request.id });
         Ok(())
     }
+
+    // ---------------------------------------------------------------
+    // Guard keys (plan B1): up to two stop-only keys. Adding and removing
+    // both wait address_delay; a guard cannot stop its own removal.
+    // ---------------------------------------------------------------
+
+    pub fn add_guard(ctx: Context<OwnerOnly>, key: Pubkey) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let owner = ctx.accounts.owner.key();
+        let extension = &mut ctx.accounts.extension;
+        require!(!extension.locked, AvelockError::VaultLocked);
+        extension.add_guard(key, &owner, now)?;
+        emit!(GuardChanged { extension: extension.key(), key, change: GUARD_ADDED });
+        Ok(())
+    }
+
+    pub fn remove_guard(ctx: Context<OwnerOnly>, key: Pubkey) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let extension = &mut ctx.accounts.extension;
+        extension.remove_guard(&key, now)?;
+        emit!(GuardChanged { extension: extension.key(), key, change: GUARD_REMOVAL_QUEUED });
+        Ok(())
+    }
+
+    pub fn cancel_guard_removal(ctx: Context<OwnerOnly>, key: Pubkey) -> Result<()> {
+        let extension = &mut ctx.accounts.extension;
+        extension.cancel_guard_removal(&key)?;
+        emit!(GuardChanged { extension: extension.key(), key, change: GUARD_REMOVAL_CANCELLED });
+        Ok(())
+    }
+
+    pub fn finalize_guard_removal(ctx: Context<OwnerOnly>, key: Pubkey) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let extension = &mut ctx.accounts.extension;
+        extension.finalize_guard_removal(&key, now)?;
+        emit!(GuardChanged { extension: extension.key(), key, change: GUARD_REMOVED });
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Panic Lock (plan B2): instant to set (owner or guard), lifted only
+    // by the owner after lock_delay.
+    // ---------------------------------------------------------------
+
+    pub fn lock(ctx: Context<OwnerOnly>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let extension = &mut ctx.accounts.extension;
+        extension.lock(now);
+        emit!(Locked { extension: extension.key(), by: ctx.accounts.owner.key(), unlock_after: extension.unlock_after });
+        Ok(())
+    }
+
+    pub fn unlock(ctx: Context<OwnerOnly>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let extension = &mut ctx.accounts.extension;
+        extension.unlock(now)?;
+        emit!(Unlocked { extension: extension.key() });
+        Ok(())
+    }
+
+    // Guard actions: the guard signs and pays its own fees.
+
+    pub fn guard_lock(ctx: Context<GuardAction>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let extension = &mut ctx.accounts.extension;
+        require!(extension.is_guard(&ctx.accounts.guard.key(), now), AvelockError::NotGuard);
+        extension.lock(now);
+        emit!(Locked { extension: extension.key(), by: ctx.accounts.guard.key(), unlock_after: extension.unlock_after });
+        Ok(())
+    }
+
+    pub fn guard_cancel_param_change(ctx: Context<GuardAction>, param: u8) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let extension = &mut ctx.accounts.extension;
+        require!(extension.is_guard(&ctx.accounts.guard.key(), now), AvelockError::NotGuard);
+        let idx = param as usize;
+        require!(idx < PARAM_COUNT, AvelockError::InvalidParameter);
+        require!(extension.pending[idx].exists, AvelockError::NoPendingChange);
+        extension.pending[idx] = PendingParamChange::default();
+        emit!(ParamChangeCancelled { extension: extension.key(), param });
+        Ok(())
+    }
+
+    pub fn guard_drop_pending_guard(ctx: Context<GuardAction>, key: Pubkey) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let extension = &mut ctx.accounts.extension;
+        require!(extension.is_guard(&ctx.accounts.guard.key(), now), AvelockError::NotGuard);
+        extension.drop_pending_guard(&key, now)?;
+        emit!(GuardChanged { extension: extension.key(), key, change: GUARD_REMOVED });
+        Ok(())
+    }
+
+    pub fn guard_cancel_withdrawal(ctx: Context<GuardCancelWithdrawal>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(ctx.accounts.extension.is_guard(&ctx.accounts.guard.key(), now), AvelockError::NotGuard);
+        let request = &mut ctx.accounts.request;
+        require!(!request.executed && !request.cancelled, AvelockError::RequestAlreadyFinal);
+        request.cancelled = true;
+        emit!(WithdrawalCancelled { extension: request.extension, id: request.id });
+        Ok(())
+    }
+
+    pub fn guard_cancel_pending_address(ctx: Context<GuardCancelPendingAddress>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(ctx.accounts.extension.is_guard(&ctx.accounts.guard.key(), now), AvelockError::NotGuard);
+        let entry = &mut ctx.accounts.entry;
+        require!(entry.active_at != 0 && now < entry.active_at, AvelockError::NotPending);
+        entry.epoch = entry.epoch.checked_add(1).unwrap();
+        entry.active_at = 0;
+        emit!(AddressRemoved { extension: entry.extension, destination: entry.destination });
+        Ok(())
+    }
 }
+
+pub const GUARD_ADDED: u8 = 0;
+pub const GUARD_REMOVAL_QUEUED: u8 = 1;
+pub const GUARD_REMOVAL_CANCELLED: u8 = 2;
+pub const GUARD_REMOVED: u8 = 3;
 
 fn validate_param(param: u8, value: i64) -> Result<()> {
     let limit = if param == PARAM_CONFIRMATION_WINDOW { MAX_CONFIRMATION_WINDOW } else { MAX_DELAY };
@@ -353,6 +508,8 @@ fn validate_param(param: u8, value: i64) -> Result<()> {
 fn propose_change(extension: &mut Account<SecurityExtension>, param: u8, new_value: i64, current_value: i64) -> Result<()> {
     validate_param(param, new_value)?;
     if new_value == current_value {
+        // Withdraws a queued change for this parameter (audit M-1).
+        extension.pending[param as usize] = PendingParamChange::default();
         return Ok(());
     }
     let now = Clock::get()?.unix_timestamp;
@@ -367,6 +524,7 @@ fn write_param(extension: &mut Account<SecurityExtension>, param: u8, value: i64
         PARAM_WITHDRAWAL_DELAY => extension.withdrawal_delay = value,
         PARAM_ADDRESS_DELAY => extension.address_delay = value,
         PARAM_CONFIRMATION_WINDOW => extension.confirmation_window = value,
+        PARAM_LOCK_DELAY => extension.lock_delay = value,
         _ => extension.policy_delay = value,
     }
 }
@@ -620,6 +778,64 @@ pub struct ConfirmTokenWithdrawal<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// A guard key acting on the extension (it signs and pays; no owner involved).
+#[derive(Accounts)]
+pub struct GuardAction<'info> {
+    pub guard: Signer<'info>,
+
+    pub vault: Account<'info, Vault>,
+
+    #[account(
+        mut,
+        seeds = [SecurityExtension::SEED_PREFIX, vault.key().as_ref()],
+        bump = extension.bump,
+        constraint = vault.security_extension == extension.key(),
+    )]
+    pub extension: Account<'info, SecurityExtension>,
+}
+
+#[derive(Accounts)]
+pub struct GuardCancelWithdrawal<'info> {
+    pub guard: Signer<'info>,
+
+    pub vault: Account<'info, Vault>,
+
+    #[account(
+        seeds = [SecurityExtension::SEED_PREFIX, vault.key().as_ref()],
+        bump = extension.bump,
+        constraint = vault.security_extension == extension.key(),
+    )]
+    pub extension: Account<'info, SecurityExtension>,
+
+    #[account(
+        mut,
+        seeds = [WithdrawalRequest::SEED_PREFIX, extension.key().as_ref(), &request.id.to_le_bytes()],
+        bump = request.bump,
+    )]
+    pub request: Account<'info, WithdrawalRequest>,
+}
+
+#[derive(Accounts)]
+pub struct GuardCancelPendingAddress<'info> {
+    pub guard: Signer<'info>,
+
+    pub vault: Account<'info, Vault>,
+
+    #[account(
+        seeds = [SecurityExtension::SEED_PREFIX, vault.key().as_ref()],
+        bump = extension.bump,
+        constraint = vault.security_extension == extension.key(),
+    )]
+    pub extension: Account<'info, SecurityExtension>,
+
+    #[account(
+        mut,
+        seeds = [AllowlistEntry::SEED_PREFIX, extension.key().as_ref(), entry.destination.as_ref()],
+        bump = entry.bump,
+    )]
+    pub entry: Account<'info, AllowlistEntry>,
+}
+
 #[derive(Accounts)]
 pub struct PruneRequest<'info> {
     #[account(mut)]
@@ -715,6 +931,26 @@ pub struct ParamChangeCancelled {
 pub struct RequestPruned {
     pub extension: Pubkey,
     pub id: u64,
+}
+
+#[event]
+pub struct GuardChanged {
+    pub extension: Pubkey,
+    pub key: Pubkey,
+    /// GUARD_ADDED / GUARD_REMOVAL_QUEUED / GUARD_REMOVAL_CANCELLED / GUARD_REMOVED
+    pub change: u8,
+}
+
+#[event]
+pub struct Locked {
+    pub extension: Pubkey,
+    pub by: Pubkey,
+    pub unlock_after: i64,
+}
+
+#[event]
+pub struct Unlocked {
+    pub extension: Pubkey,
 }
 
 #[cfg(test)]

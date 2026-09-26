@@ -8,8 +8,9 @@
 // internal key is the BIP-341 NUMS point, whose secret nobody knows) and
 // one script leaf per "door" (see BITCOIN_DESIGN.md):
 //
-//   cosigned  owner + one signer        immediately; the signer enforces
-//                                       delays/allowlist off-chain
+//   cosigned  owner + `threshold` of the signers   immediately; the
+//             signers enforce delays/allowlist off-chain. One leaf per
+//             signer subset of that size (2-of-3: three leaves).
 //   reserve   owner alone               after `reserveBlocks` (CSV)
 //   heir      inheritance key alone     after `heirBlocks` (CSV), optional
 //
@@ -36,8 +37,10 @@ export type Door = 'cosigned' | 'reserve' | 'heir';
 export interface VaultParams {
   /** 32-byte x-only owner key. */
   owner: Buffer;
-  /** 32-byte x-only signer keys; the cosigned door accepts any one of them. */
+  /** 32-byte x-only signer keys. */
   signers: Buffer[];
+  /** How many of the signers must co-sign with the owner (default 1). */
+  threshold?: number;
   /** Blocks after which the owner alone may spend. */
   reserveBlocks: number;
   /** Optional 32-byte x-only inheritance key. */
@@ -49,8 +52,8 @@ export interface VaultParams {
 
 export interface Leaf {
   door: Door;
-  /** For cosigned leaves: which signer key this leaf pairs with the owner. */
-  signer?: Buffer;
+  /** For cosigned leaves: the signer keys this leaf needs (sorted). */
+  signers?: Buffer[];
   script: Buffer;
   leafVersion: number;
 }
@@ -75,12 +78,26 @@ function assertBlocks(value: number, name: string) {
   }
 }
 
-/** <owner> CHECKSIGVERIFY <signer> CHECKSIG — witness: [signerSig, ownerSig]. */
-export function cosignedScript(owner: Buffer, signer: Buffer): Buffer {
-  return bitcoin.script.compile([
-    owner, bitcoin.opcodes.OP_CHECKSIGVERIFY,
-    signer, bitcoin.opcodes.OP_CHECKSIG,
-  ]);
+/**
+ * <owner> CHECKSIGVERIFY <s1> CHECKSIGVERIFY … <sn> CHECKSIG
+ * witness (bottom → top): [sig sn, …, sig s1, ownerSig]. With one signer this
+ * is byte-for-byte the original 1-of-n leaf, so existing vaults keep their
+ * addresses.
+ */
+export function cosignedScript(owner: Buffer, signers: Buffer | Buffer[]): Buffer {
+  const keys = Array.isArray(signers) ? signers : [signers];
+  if (keys.length < 1) throw new Error('a cosigned leaf needs at least one signer');
+  const ops: (Buffer | number)[] = [owner, bitcoin.opcodes.OP_CHECKSIGVERIFY];
+  keys.forEach((k, i) => ops.push(k, i === keys.length - 1 ? bitcoin.opcodes.OP_CHECKSIG : bitcoin.opcodes.OP_CHECKSIGVERIFY));
+  return bitcoin.script.compile(ops);
+}
+
+/** All subsets of `size` keys, in canonical order. */
+export function combinations<T>(items: T[], size: number): T[][] {
+  if (size === 0) return [[]];
+  if (items.length < size) return [];
+  const [first, ...rest] = items;
+  return [...combinations(rest, size - 1).map(c => [first, ...c]), ...combinations(rest, size)];
 }
 
 /** <blocks> CSV DROP <key> CHECKSIG — witness: [sig]. */
@@ -115,6 +132,11 @@ export function createVault(params: VaultParams): Vault {
   if (distinct.size !== 1 + params.signers.length + (params.heir ? 1 : 0)) {
     throw new Error('owner, signer and heir keys must all be different');
   }
+  const threshold = params.threshold ?? 1;
+  if (!Number.isInteger(threshold) || threshold < 1 || threshold > params.signers.length) {
+    throw new Error('threshold must be between 1 and the number of signers');
+  }
+  if (threshold === 1 && params.threshold !== undefined) params = { ...params, threshold: undefined };
   assertBlocks(params.reserveBlocks, 'reserveBlocks');
   if ((params.heir == null) !== (params.heirBlocks == null)) throw new Error('heir and heirBlocks go together');
   if (params.heir) {
@@ -125,7 +147,7 @@ export function createVault(params: VaultParams): Vault {
   }
 
   const leaves: Leaf[] = [
-    ...params.signers.map(signer => ({ door: 'cosigned' as const, signer, script: cosignedScript(params.owner, signer), leafVersion: LEAF_VERSION })),
+    ...combinations(params.signers, threshold).map(signers => ({ door: 'cosigned' as const, signers, script: cosignedScript(params.owner, signers), leafVersion: LEAF_VERSION })),
     { door: 'reserve', script: timelockedScript(params.owner, params.reserveBlocks), leafVersion: LEAF_VERSION },
     ...(params.heir ? [{ door: 'heir' as const, script: timelockedScript(params.heir, params.heirBlocks!), leafVersion: LEAF_VERSION }] : []),
   ];
@@ -134,10 +156,15 @@ export function createVault(params: VaultParams): Vault {
   return { params, address: payment.address!, output: payment.output!, leaves, scriptTree };
 }
 
+/** Cosigned-door signer set: one key or several, in canonical order. */
+export const signerSet = (signers?: Buffer | Buffer[]) => (signers == null ? [] : (Array.isArray(signers) ? [...signers] : [signers]).sort(Buffer.compare));
+
 /** The leaf and control block needed to spend through one door. */
-export function spendInfo(vault: Vault, door: Door, signer?: Buffer) {
-  const leaf = vault.leaves.find(l => l.door === door && (door !== 'cosigned' || (signer != null && l.signer!.equals(signer))));
-  if (!leaf) throw new Error(`vault has no ${door} door${signer ? ' for this signer' : ''}`);
+export function spendInfo(vault: Vault, door: Door, signers?: Buffer | Buffer[]) {
+  const want = signerSet(signers);
+  const leaf = vault.leaves.find(l => l.door === door && (door !== 'cosigned'
+    || (l.signers!.length === want.length && l.signers!.every((k, i) => k.equals(want[i])))));
+  if (!leaf) throw new Error(`vault has no ${door} door${want.length ? ' for these signers' : ''}`);
   const redeem = { output: leaf.script, redeemVersion: leaf.leafVersion };
   const payment = bitcoin.payments.p2tr({
     internalPubkey: NUMS_INTERNAL_KEY, scriptTree: vault.scriptTree, redeem, network: vault.params.network,
