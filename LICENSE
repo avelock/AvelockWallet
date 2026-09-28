@@ -1,26 +1,3 @@
-Avelock Wallet
-Copyright (C) 2026 Avelock
-
-This program is free software: you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the Free
-Software Foundation, version 3 of the License (GPL-3.0-only).
-
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License below.
-
-Note on deployed contracts: the Solidity sources in contracts/evm/src still
-carry an "SPDX-License-Identifier: BUSL-1.1" line. That comment is compiled
-into the contracts' bytecode metadata, so changing it would change the
-deployed code and the vault factory address. Avelock, as the copyright
-holder, licenses those files under GPL-3.0-only as well; the SPDX line will
-be updated with the next contract release.
-
-Third-party code (for example contracts/evm/lib/forge-std and
-openzeppelin-contracts) keeps its own license.
-
------------------------------------------------------------------------------
-
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
 

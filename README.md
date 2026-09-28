@@ -21,7 +21,7 @@ Every Vault follows the same rules on every network:
   A lock also drops every queued change, including a queued removal of a
   guard, and a guard cannot be removed while the Vault is locked.
 
-All networks are test networks for now.
+All networks are test networks for now, and the code is not audited yet.
 
 
 ## Networks
@@ -182,4 +182,4 @@ independent operators run one each; any two co-sign.
 
 ## License
 
-Avelock Wallet is free and open-source software under the [GNU General Public License v3.0](LICENSE) (GPL-3.0-only): anyone may use, study, modify and share it, and any distributed modified version must be released under the same license. The Solidity sources in `contracts/evm/src` still carry a `BUSL-1.1` SPDX line because it is compiled into the deployed bytecode; they are licensed under GPL-3.0-only as well (see [LICENSE](LICENSE)). Third-party dependencies (for example `lib/forge-std`) keep their own licenses.
+Avelock Wallet is free and open-source software under the [GNU General Public License v3.0](LICENSE) (GPL-3.0-only): anyone may use, study, modify and share it, and any distributed modified version must be released under the same license. See [NOTICE](NOTICE). Third-party dependencies (for example `lib/forge-std`) keep their own licenses.

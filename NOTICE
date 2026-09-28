@@ -1,0 +1,13 @@
+Avelock Wallet
+Copyright (C) 2026 Avelock
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, version 3 of the License (GPL-3.0-only).
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License in LICENSE.
+
+Third-party code (for example contracts/evm/lib/forge-std and
+openzeppelin-contracts) keeps its own license.
