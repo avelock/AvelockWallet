@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "types": ["mocha", "chai", "node"],
+    "target": "es2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "strict": true
+  }
+}

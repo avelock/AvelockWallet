@@ -39,8 +39,8 @@ export interface VaultParams {
   owner: Buffer;
   /** 32-byte x-only signer keys. */
   signers: Buffer[];
-  /** How many of the signers must co-sign with the owner (default 1). */
-  threshold?: number;
+  /** How many of the signers must co-sign with the owner. Always stated (audit A13-7b). */
+  threshold: number;
   /** Blocks after which the owner alone may spend. */
   reserveBlocks: number;
   /** Optional 32-byte x-only inheritance key. */
@@ -132,11 +132,10 @@ export function createVault(params: VaultParams): Vault {
   if (distinct.size !== 1 + params.signers.length + (params.heir ? 1 : 0)) {
     throw new Error('owner, signer and heir keys must all be different');
   }
-  const threshold = params.threshold ?? 1;
+  const threshold = params.threshold;
   if (!Number.isInteger(threshold) || threshold < 1 || threshold > params.signers.length) {
     throw new Error('threshold must be between 1 and the number of signers');
   }
-  if (threshold === 1 && params.threshold !== undefined) params = { ...params, threshold: undefined };
   assertBlocks(params.reserveBlocks, 'reserveBlocks');
   if ((params.heir == null) !== (params.heirBlocks == null)) throw new Error('heir and heirBlocks go together');
   if (params.heir) {

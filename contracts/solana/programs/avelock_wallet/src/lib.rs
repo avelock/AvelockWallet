@@ -513,18 +513,35 @@ fn propose_change(extension: &mut Account<SecurityExtension>, param: u8, new_val
         return Ok(());
     }
     let now = Clock::get()?.unix_timestamp;
-    let effective_at = now + extension.policy_delay;
+    let effective_at = now + change_wait(extension.policy_delay, extension.withdrawal_delay);
     extension.pending[param as usize] = PendingParamChange { new_value, effective_at, exists: true };
     emit!(ParamChangeQueued { extension: extension.key(), param, new_value, effective_at });
     Ok(())
 }
 
+/// A change waits the policy delay, never less than the withdrawal delay
+/// (audit A14-2): else a short policy delay lowers the withdrawal delay and a
+/// phrase thief withdraws sooner than the owner's delay.
+pub(crate) fn change_wait(policy_delay: i64, withdrawal_delay: i64) -> i64 {
+    policy_delay.max(withdrawal_delay)
+}
+
+/// The lock delay a change may leave: never below the withdrawal delay.
+pub(crate) fn lock_delay_floor(lock_delay: i64, withdrawal_delay: i64) -> i64 {
+    lock_delay.max(withdrawal_delay)
+}
+
+/// Invariant (audit A12-3): lock_delay >= withdrawal_delay when a change
+/// applies, so a lock never lifts sooner than a withdrawal could complete.
 fn write_param(extension: &mut Account<SecurityExtension>, param: u8, value: i64) {
     match param {
-        PARAM_WITHDRAWAL_DELAY => extension.withdrawal_delay = value,
+        PARAM_WITHDRAWAL_DELAY => {
+            extension.withdrawal_delay = value;
+            extension.lock_delay = lock_delay_floor(extension.lock_delay, value);
+        }
         PARAM_ADDRESS_DELAY => extension.address_delay = value,
         PARAM_CONFIRMATION_WINDOW => extension.confirmation_window = value,
-        PARAM_LOCK_DELAY => extension.lock_delay = value,
+        PARAM_LOCK_DELAY => extension.lock_delay = lock_delay_floor(value, extension.withdrawal_delay),
         _ => extension.policy_delay = value,
     }
 }
@@ -970,5 +987,32 @@ mod account_metadata_tests {
         let refund = metas.iter().find(|meta| meta.pubkey == owner).unwrap();
         assert!(refund.is_signer);
         assert!(refund.is_writable);
+    }
+}
+
+#[cfg(test)]
+mod lock_delay_tests {
+    use super::lock_delay_floor;
+
+    /// Audit A12-3: a lock never lifts sooner than a withdrawal could complete.
+    #[test]
+    fn lock_delay_never_goes_below_the_withdrawal_delay() {
+        let day = 86_400;
+        assert_eq!(lock_delay_floor(day, 30 * day), 30 * day); // raising W raises the lock delay
+        assert_eq!(lock_delay_floor(10 * day, day), 10 * day); // a longer lock delay stays
+    }
+}
+
+#[cfg(test)]
+mod change_wait_tests {
+    use super::change_wait;
+
+    /// Audit A14-2: a short policy delay cannot lower the withdrawal delay
+    /// sooner than a withdrawal under it could complete.
+    #[test]
+    fn a_change_waits_at_least_the_withdrawal_delay() {
+        let day = 86_400;
+        assert_eq!(change_wait(3_600, 14 * day), 14 * day);
+        assert_eq!(change_wait(30 * day, 7 * day), 30 * day);
     }
 }

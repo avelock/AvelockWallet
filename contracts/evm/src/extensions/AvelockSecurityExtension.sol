@@ -167,6 +167,7 @@ contract AvelockSecurityExtension is IExtension {
     error Erc20TransferFailed();
     error AlreadyInitialized();
     error VaultLocked();
+    error NftTransferFailed();
     error NotLocked();
     error LockNotExpired();
     error TooManyGuards();
@@ -270,9 +271,11 @@ contract AvelockSecurityExtension is IExtension {
         // Copy before the delete: `p` is a storage reference, so after it the
         // event would carry 0 instead of the applied value (AVL-EVM-001).
         uint256 newValue = p.newValue;
-        _writeParam(param, newValue);
+        // The event carries what was actually written: a lockDelay below the
+        // withdrawal delay is stored as the withdrawal delay (A12-3 review).
+        uint256 written = _writeParam(param, newValue);
         delete pendingParamChanges[param];
-        emit ParamChangeApplied(param, newValue);
+        emit ParamChangeApplied(param, written);
     }
 
     /// @notice Cancel a queued parameter change before it takes effect (owner or guard).
@@ -306,14 +309,30 @@ contract AvelockSecurityExtension is IExtension {
             }
             return;
         }
-        uint256 effectiveAt = block.timestamp + policyDelay;
+        uint256 effectiveAt = block.timestamp + changeWait();
         pendingParamChanges[param] = PendingParamChange(newValue, effectiveAt, true);
         emit ParamChangeQueued(param, newValue, effectiveAt);
     }
 
-    function _writeParam(Param param, uint256 value) internal {
+    /// @notice How long a parameter change waits: the policy delay, but never
+    ///         less than the withdrawal delay (audit A14-2). Otherwise a short
+    ///         policy delay would let a phrase thief lower the withdrawal delay
+    ///         and withdraw sooner than the delay the owner set.
+    function changeWait() public view returns (uint256) {
+        return policyDelay > withdrawalDelay ? policyDelay : withdrawalDelay;
+    }
+
+    /// @dev Invariant (audit A12-3): lockDelay >= withdrawalDelay, held when a
+    ///      change applies — a lock must not lift sooner than a withdrawal
+    ///      could complete, or a phrase thief shortens the recovery window.
+    function _writeParam(Param param, uint256 value) internal returns (uint256 written) {
+        written = value;
         if (param == Param.WithdrawalDelay) {
             withdrawalDelay = value;
+            if (lockDelay < value) {
+                lockDelay = value;
+                emit ParamChangeApplied(Param.LockDelay, value);
+            }
         } else if (param == Param.AddressDelay) {
             addressDelay = value;
         } else if (param == Param.ConfirmationWindow) {
@@ -321,7 +340,8 @@ contract AvelockSecurityExtension is IExtension {
         } else if (param == Param.PolicyDelay) {
             policyDelay = value;
         } else {
-            lockDelay = value;
+            written = value < withdrawalDelay ? withdrawalDelay : value;
+            lockDelay = written;
         }
     }
 
@@ -470,6 +490,7 @@ contract AvelockSecurityExtension is IExtension {
 
         bool isErc20 = kind == 0 && r.token != address(0);
         uint256 balanceBefore = isErc20 ? _tokenBalance(r.token, walletAddress) : 0;
+        uint256 heldBefore = kind == 2 ? _heldOf(r.token, walletAddress, tokenId[requestId]) : 0;
 
         emit WithdrawalExecuted(requestId);
         bytes memory returndata = IAvelockWallet(walletAddress).executeFromExtension(callTarget, callValue, data);
@@ -485,6 +506,25 @@ contract AvelockSecurityExtension is IExtension {
                 if (balanceAfter > balanceBefore || balanceBefore - balanceAfter != r.amount) revert Erc20TransferFailed();
             }
         }
+        // An NFT contract that returns without moving the token must not
+        // leave the request marked done (audit A15-9).
+        if (kind == 1 && _ownerOf(r.token, tokenId[requestId]) != r.to) revert NftTransferFailed();
+        if (kind == 2) {
+            uint256 heldAfter = _heldOf(r.token, walletAddress, tokenId[requestId]);
+            if (heldAfter > heldBefore || heldBefore - heldAfter != r.amount) revert NftTransferFailed();
+        }
+    }
+
+    function _ownerOf(address token, uint256 id) private view returns (address) {
+        (bool ok, bytes memory out) = token.staticcall(abi.encodeWithSignature("ownerOf(uint256)", id));
+        if (!ok || out.length < 32) revert NftTransferFailed();
+        return abi.decode(out, (address));
+    }
+
+    function _heldOf(address token, address holder, uint256 id) private view returns (uint256) {
+        (bool ok, bytes memory out) = token.staticcall(abi.encodeWithSignature("balanceOf(address,uint256)", holder, id));
+        if (!ok || out.length < 32) revert NftTransferFailed();
+        return abi.decode(out, (uint256));
     }
 
     function _tokenBalance(address token, address holder) private view returns (uint256) {
@@ -569,6 +609,8 @@ contract AvelockSecurityExtension is IExtension {
             return;
         }
         if (!owner) revert NotOwner();
+        // Queued only while unlocked, and a lock drops the queue (audit A15-1).
+        if (locked) revert VaultLocked();
         if (g.removableAt != 0) return;
         uint256 removableAt = block.timestamp + addressDelay;
         g.removableAt = uint64(removableAt);
@@ -582,7 +624,10 @@ contract AvelockSecurityExtension is IExtension {
         emit GuardRemovalCancelled(key);
     }
 
-    function finalizeGuardRemoval(address key) external onlyOwner {
+    /// @dev Never during a lock (audit A15-1): otherwise a phrase thief queues
+    ///      the removal, waits out the guard's lock, and no one is left to
+    ///      extend it.
+    function finalizeGuardRemoval(address key) external onlyOwner whenUnlocked {
         uint256 i = _guardIndex(key);
         uint256 removableAt = guardSlots[i].removableAt;
         if (removableAt == 0) revert NotPending();
@@ -626,6 +671,10 @@ contract AvelockSecurityExtension is IExtension {
             if (g.key != address(0) && block.timestamp < g.activeAt) {
                 emit GuardRemoved(g.key);
                 delete guardSlots[i];
+            } else if (g.removableAt != 0) {
+                // A queued removal of an active guard is void too (A15-1).
+                g.removableAt = 0;
+                emit GuardRemovalCancelled(g.key);
             }
         }
         emit Locked(msg.sender, until);

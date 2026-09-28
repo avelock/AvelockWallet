@@ -4,19 +4,22 @@ Self-custody vault with on-chain withdrawal delays. This repository
 contains the contract and script sources for every supported network —
 EVM chains, TRON, TON, Solana, Bitcoin and Litecoin — published so anyone
 can verify what runs on-chain (Etherscan / Tronscan / verifier.ton.org, or
-by rebuilding a Bitcoin/Litecoin address). It is the sources-only mirror of
-a larger project; application code, tests and CI live in the private
-development repository and are not published here.
+by rebuilding a Bitcoin/Litecoin address), with the tests for each and the
+Bitcoin/Litecoin co-signer. The mobile app is not published here yet.
 
 Every Vault follows the same rules on every network:
 
 - a withdrawal is requested first and can be confirmed only after the
   owner-chosen delay, and only to an address on the Vault's allowlist;
-- a new allowed address, and any weakening of the policy, also waits out
-  its own delay; stopping actions (cancel, lock) are always immediate;
+- a new allowed address waits its own delay; any settings change waits the
+  policy delay and never less than the current withdrawal delay, so a
+  stolen key cannot shorten the delay faster than it could simply wait;
+- stopping actions (cancel, lock) are always immediate;
 - optional **guard keys** can cancel a pending withdrawal or trigger a
   **Panic Lock**, but can never move funds, add addresses or unlock;
-  lifting a lock waits `lockDelay`.
+  lifting a lock waits `lockDelay` (never less than the withdrawal delay).
+  A lock also drops every queued change, including a queued removal of a
+  guard, and a guard cannot be removed while the Vault is locked.
 
 All networks are test networks for now.
 
@@ -160,6 +163,23 @@ Bitcoin, 1 Bitcoin test networks, 2 Litecoin),
 address from its public keys and parameters and compare. `npm install &&
 npm run build` compiles them.
 
+## Co-signer (Bitcoin and Litecoin)
+
+`contracts/utxo/src/signer` — the co-signer service. It keeps each vault's
+policy (delays, allowlist, guard keys, Panic Lock, fee cap) and signs a
+spend only when that policy allows it; every operation is signed by the
+owner's key and advances a hash-chained state head the app checks. Three
+independent operators run one each; any two co-sign.
+
+## Tests
+
+| Folder | Command |
+|---|---|
+| `contracts/evm` | `forge test` |
+| `contracts/ton` | `npm ci && npm test` |
+| `contracts/solana` | `cargo test --manifest-path programs/avelock_wallet/Cargo.toml` (unit), `anchor test` (local validator) |
+| `contracts/utxo` | `npm ci && npm test` |
+
 ## License
 
-Avelock Wallet is licensed under the [Business Source License 1.1](LICENSE) (source-available, not open source). The source can be read, audited, modified and used to verify deployed contracts. Individuals may use it to hold and manage their own assets in their own Vault. Commercial use — including embedding it in wallets, exchanges, custody, SDKs or hosted services — requires a commercial license from Avelock. Each version converts to GPL-2.0-or-later on the Change Date (2030-09-23) or four years after its first public release, whichever comes first. Third-party dependencies (for example `lib/forge-std`) keep their own licenses.
+Avelock Wallet is free and open-source software under the [GNU General Public License v3.0](LICENSE) (GPL-3.0-only): anyone may use, study, modify and share it, and any distributed modified version must be released under the same license. The Solidity sources in `contracts/evm/src` still carry a `BUSL-1.1` SPDX line because it is compiled into the deployed bytecode; they are licensed under GPL-3.0-only as well (see [LICENSE](LICENSE)). Third-party dependencies (for example `lib/forge-std`) keep their own licenses.

@@ -550,6 +550,8 @@ contract AvelockSecurityExtension {
             if (now() < g.activeAt) {
                 self.guards.set(key, null);
             } else if (g.removableAt == 0) {
+                // Queued only while unlocked; a lock drops it (audit A15-1).
+                throwUnless(71, !self.locked);
                 self.guards.set(key, GuardState{ activeAt: g.activeAt, removableAt: now() + self.addressDelay });
             }
         } else if (op == OP_CANCEL_GUARD_REMOVAL) {
@@ -562,6 +564,9 @@ contract AvelockSecurityExtension {
             let g: GuardState = self.guards.get(key)!!;
             throwUnless(75, g.removableAt != 0);
             throwUnless(59, now() >= g.removableAt);
+            // Never during a lock (audit A15-1): else a phrase thief waits out
+            // the guard's lock and no one is left to extend it.
+            throwUnless(71, !self.locked);
             self.guards.set(key, null);
         } else if (op == OP_LOCK) {
             self._lock();
@@ -626,7 +631,8 @@ contract AvelockSecurityExtension {
     }
 
     // Panic Lock: instant; voids pending requests, destinations and asset
-    // registrations, cancels queued changes and pending guards. Locking
+    // registrations, cancels queued changes, pending guards and queued guard
+    // removals. Locking
     // again extends it. Only the owner lifts it, after lockDelay.
     fun _lock() {
         let lockedUntil: Int = now() + self.lockDelay;
@@ -640,11 +646,17 @@ contract AvelockSecurityExtension {
         self.lockTimes.set(self.lockEpoch, now());
         self.pendingParamChanges = emptyMap();
         let waiting: map<Address, Bool> = emptyMap();
+        let leaving: map<Address, Int> = emptyMap();
         foreach (key, g in self.guards) {
             if (now() < g.activeAt) { waiting.set(key, true); }
+            else if (g.removableAt != 0) { leaving.set(key, g.activeAt); }
         }
         foreach (key, flag in waiting) {
             self.guards.set(key, null);
+        }
+        // A queued removal of an active guard is void too (A15-1).
+        foreach (key, activeAt in leaving) {
+            self.guards.set(key, GuardState{ activeAt: activeAt, removableAt: 0 });
         }
     }
 
@@ -743,20 +755,31 @@ contract AvelockSecurityExtension {
         }
         self.pendingParamChanges.set(param, PendingParamChange{
             newValue: newValue,
-            effectiveAt: now() + self.policyDelay,
+            effectiveAt: now() + self.changeWait(),
             exists: true,
         });
     }
 
+    // A change waits the policy delay, never less than the withdrawal delay
+    // (audit A14-2): else a short policy delay lowers the withdrawal delay
+    // and a phrase thief withdraws sooner than the owner's delay.
+    fun changeWait(): Int {
+        return max(self.policyDelay, self.withdrawalDelay);
+    }
+
+    // Invariant (audit A12-3): lockDelay >= withdrawalDelay when a change
+    // applies, so a lock never lifts sooner than a withdrawal could complete.
     fun _writeParam(param: Int, value: Int) {
         if (param == PARAM_WITHDRAWAL_DELAY) {
             self.withdrawalDelay = value;
+            if (self.lockDelay < value) { self.lockDelay = value; }
         } else if (param == PARAM_ADDRESS_DELAY) {
             self.addressDelay = value;
         } else if (param == PARAM_CONFIRMATION_WINDOW) {
             self.confirmationWindow = value;
         } else if (param == PARAM_LOCK_DELAY) {
             self.lockDelay = value;
+            if (value < self.withdrawalDelay) { self.lockDelay = self.withdrawalDelay; }
         } else {
             self.policyDelay = value;
         }

@@ -1,0 +1,23 @@
+{
+  "name": "avelock-wallet-solana-tests",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "ts-mocha -p ./tsconfig.json -t 120000 tests/**/*.ts",
+    "test:unit": "ts-mocha -p ./tsconfig.json -t 10000 tests/unit/**/*.spec.ts",
+    "typecheck": "tsc --noEmit",
+    "check:release": "ts-node scripts/release-readiness.ts"
+  },
+  "devDependencies": {
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.95.3",
+    "@types/chai": "^4.3.16",
+    "@types/mocha": "^10.0.7",
+    "@types/node": "^22.5.4",
+    "borsh": "^2.0.0",
+    "chai": "^4.4.1",
+    "mocha": "^10.7.3",
+    "ts-mocha": "^10.0.0",
+    "typescript": "^5.5.4"
+  }
+}

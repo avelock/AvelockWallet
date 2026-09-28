@@ -1,3 +1,10 @@
-target
 .anchor
+.DS_Store
+target
+node_modules
+dist
+build
 test-ledger
+# Cargo.lock is committed deliberately — several transitive deps had to be
+# pinned below their latest semver-compatible release to build against the
+# rustc 1.75 bundled in anchor 0.30.1's platform-tools; see README.md.

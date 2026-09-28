@@ -164,7 +164,9 @@ impl SecurityExtension {
         if now < g.active_at {
             *g = GuardSlot::default();
         } else if g.removable_at == 0 {
-            g.removable_at = now + address_delay;
+            // Queued only while unlocked; a lock drops it (audit A15-1).
+            require!(!self.locked, AvelockError::VaultLocked);
+            self.guards[i].removable_at = now + address_delay;
         }
         Ok(())
     }
@@ -189,12 +191,16 @@ impl SecurityExtension {
         let at = self.guards[i].removable_at;
         require!(at != 0, AvelockError::NotPending);
         require!(now >= at, AvelockError::ChangeNotReady);
+        // Never during a lock (audit A15-1): else a phrase thief waits out
+        // the guard's lock and no one is left to extend it.
+        require!(!self.locked, AvelockError::VaultLocked);
         self.guards[i] = GuardSlot::default();
         Ok(())
     }
 
     /// Panic Lock: instant. Voids pending requests and waiting destinations
-    /// (by epoch), cancels queued changes and waiting guards. Locking again
+    /// (by epoch), cancels queued changes, waiting guards and queued guard
+    /// removals. Locking again
     /// extends the wait.
     pub fn lock(&mut self, now: i64) {
         let until = now + self.lock_delay;
@@ -210,6 +216,9 @@ impl SecurityExtension {
         for g in self.guards.iter_mut() {
             if g.key != Pubkey::default() && now < g.active_at {
                 *g = GuardSlot::default();
+            } else {
+                // A queued removal of an active guard is void too (A15-1).
+                g.removable_at = 0;
             }
         }
     }
@@ -397,6 +406,25 @@ mod guard_lock_tests {
         assert!(ext.add_guard(owner, &owner, 100).is_err()); // the owner itself
         ext.add_guard(b, &owner, 100).unwrap();
         assert!(ext.add_guard(c, &owner, 100).is_err()); // a third
+    }
+
+    /// A15-1: a queued removal of the guard cannot finish during a lock, the
+    /// lock drops it, and a new one cannot be queued while locked.
+    #[test]
+    fn a_lock_drops_a_queued_guard_removal_and_it_cannot_finish_while_locked() {
+        let owner = Pubkey::new_unique();
+        let g = Pubkey::new_unique();
+        let mut ext = extension();
+        ext.add_guard(g, &owner, 0).unwrap();
+        let t = 3 * DAY;
+        ext.remove_guard(&g, t).unwrap();
+        ext.lock(t + 1);
+        assert!(ext.finalize_guard_removal(&g, t + 3 * DAY).is_err());
+        assert!(ext.remove_guard(&g, t + 3 * DAY).is_err());
+        let later = t + 30 * DAY;
+        ext.unlock(later).unwrap();
+        assert!(ext.finalize_guard_removal(&g, later).is_err()); // dropped by the lock
+        assert!(ext.is_guard(&g, later));
     }
 
     #[test]
