@@ -171,6 +171,10 @@ spend only when that policy allows it; every operation is signed by the
 owner's key and advances a hash-chained state head the app checks. Three
 independent operators run one each; any two co-sign.
 
+## RPC proxy
+
+`rpc-proxy` — the Cloudflare Worker behind `rpc.avelock.app` that the app reads every network through. It only delivers: provider keys stay on the server, only the methods the app uses pass, and the app cross-checks security-relevant reads (pending withdrawals, lock state, allowlist, vault code) against independent public nodes, so a lying proxy shows up as an alarm instead of a wrong answer. Also serves the network status page. `cd rpc-proxy && npm test`.
+
 ## Tests
 
 | Folder | Command |
@@ -179,6 +183,7 @@ independent operators run one each; any two co-sign.
 | `contracts/ton` | `npm ci && npm test` |
 | `contracts/solana` | `cargo test --manifest-path programs/avelock_wallet/Cargo.toml` (unit), `anchor test` (local validator) |
 | `contracts/utxo` | `npm ci && npm test` |
+| `rpc-proxy` | `npm test` |
 
 ## License
 

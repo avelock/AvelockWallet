@@ -1,0 +1,19 @@
+name = "avelock-rpc"
+main = "src/worker.mjs"
+compatibility_date = "2026-09-01"
+workers_dev = false
+routes = [{ pattern = "rpc.avelock.app", custom_domain = true }]
+
+# Secrets (never in this file): wrangler secret put TONCENTER_KEY / TRONGRID_KEY /
+# SOL_DEVNET_URL / EVM_<NAME>_URL (a provider URL that includes its key).
+
+[observability]
+enabled = false
+
+# Per-IP limit (review RPC-4): a script cannot burn the provider quotas.
+[[ratelimits]]
+name = "PER_IP"
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 300
+  period = 60
