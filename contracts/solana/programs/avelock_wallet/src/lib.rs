@@ -17,6 +17,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 use anchor_spl::token_2022::spl_token_2022::{self, extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions}};
 use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::Token;
 
 pub mod errors;
 mod native_transfer;
@@ -394,6 +395,108 @@ pub mod avelock_wallet {
         );
         // Checked: the mint's decimals are part of the transfer (Token-2022 requires it).
         token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.mint.decimals)?;
+
+        let request = &mut ctx.accounts.request;
+        request.executed = true;
+        emit!(WithdrawalExecuted { extension: request.extension, id: request.id });
+        Ok(())
+    }
+
+    /// Programmable NFT path (Metaplex pNFT): its token account is frozen and
+    /// only Token Metadata can move it, so the vault PDA signs a Token
+    /// Metadata `TransferV1` (round2 M-2, option 3). Same request, delay and
+    /// destination checks as every other withdrawal; the destination is the
+    /// recipient's own associated token account. A collection whose rule set
+    /// forbids transfers from a program-owned account stays stuck: that rule
+    /// is the issuer's, not this program's.
+    pub fn confirm_pnft_withdrawal<'info>(ctx: Context<'_, '_, '_, 'info, ConfirmPnftWithdrawal<'info>>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let mint = ctx.accounts.mint.key();
+        {
+            let request = &ctx.accounts.request;
+            let extension = &ctx.accounts.extension;
+            require!(!extension.locked, AvelockError::VaultLocked);
+            require!(!request.executed && !request.cancelled, AvelockError::RequestAlreadyFinal);
+            require!(!request.is_annulled(extension), AvelockError::RequestAnnulled);
+            require!(now >= request.available_at, AvelockError::RequestNotReady);
+            require!(now <= request.expires_at, AvelockError::RequestExpired);
+            require!(
+                ctx.accounts.allowlist.is_active(extension, now)
+                    && ctx.accounts.allowlist.epoch == request.epoch_at_request,
+                AvelockError::DestinationNotAllowed
+            );
+            require_keys_eq!(request.to, ctx.accounts.to.key(), AvelockError::DestinationMismatch);
+            require!(request.mint == Some(mint), AvelockError::AssetMismatch);
+            require!(request.amount == 1, AvelockError::AssetMismatch);
+            require_keys_neq!(ctx.accounts.to.key(), ctx.accounts.vault.key(), AvelockError::InvalidDestination);
+            require_keys_eq!(*ctx.accounts.to.owner, anchor_lang::system_program::ID, AvelockError::InvalidDestination);
+        }
+        // Every account Token Metadata reads or writes is the one derived here.
+        let tm = TOKEN_METADATA_ID;
+        let vault_key = ctx.accounts.vault.key();
+        let to_key = ctx.accounts.to.key();
+        let ata = |owner: &Pubkey| anchor_spl::associated_token::get_associated_token_address(owner, &mint);
+        let source = ata(&vault_key);
+        let destination = ata(&to_key);
+        let pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &tm).0;
+        require_keys_eq!(ctx.accounts.vault_token_account.key(), source, AvelockError::AssetMismatch);
+        require_keys_eq!(ctx.accounts.destination_token_account.key(), destination, AvelockError::AssetMismatch);
+        require_keys_eq!(ctx.accounts.metadata.key(), pda(&[b"metadata", tm.as_ref(), mint.as_ref()]), AvelockError::AssetMismatch);
+        require_keys_eq!(ctx.accounts.edition.key(), pda(&[b"metadata", tm.as_ref(), mint.as_ref(), b"edition"]), AvelockError::AssetMismatch);
+        require_keys_eq!(ctx.accounts.token_record.key(), pda(&[b"metadata", tm.as_ref(), mint.as_ref(), b"token_record", source.as_ref()]), AvelockError::AssetMismatch);
+        require_keys_eq!(ctx.accounts.destination_token_record.key(), pda(&[b"metadata", tm.as_ref(), mint.as_ref(), b"token_record", destination.as_ref()]), AvelockError::AssetMismatch);
+
+        let owner_key = ctx.accounts.vault.owner;
+        let bump = ctx.accounts.vault.bump;
+        let seeds: &[&[u8]] = &[Vault::SEED_PREFIX, owner_key.as_ref(), &[bump]];
+        // Absent optional accounts are passed as the Token Metadata program id.
+        let rules_program = ctx.accounts.authorization_rules_program.as_ref().map(|a| a.to_account_info()).unwrap_or_else(|| ctx.accounts.token_metadata_program.to_account_info());
+        let rules = ctx.accounts.authorization_rules.as_ref().map(|a| a.to_account_info()).unwrap_or_else(|| ctx.accounts.token_metadata_program.to_account_info());
+        let infos = [
+            ctx.accounts.vault_token_account.to_account_info(),
+            ctx.accounts.vault.to_account_info(),
+            ctx.accounts.destination_token_account.to_account_info(),
+            ctx.accounts.to.to_account_info(),
+            ctx.accounts.mint.to_account_info(),
+            ctx.accounts.metadata.to_account_info(),
+            ctx.accounts.edition.to_account_info(),
+            ctx.accounts.token_record.to_account_info(),
+            ctx.accounts.destination_token_record.to_account_info(),
+            ctx.accounts.vault.to_account_info(),
+            ctx.accounts.owner.to_account_info(),
+            ctx.accounts.system_program.to_account_info(),
+            ctx.accounts.sysvar_instructions.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.associated_token_program.to_account_info(),
+            rules_program,
+            rules,
+        ];
+        let w = |i: &AccountInfo, signer: bool, writable: bool| anchor_lang::solana_program::instruction::AccountMeta { pubkey: i.key(), is_signer: signer, is_writable: writable };
+        let accounts = vec![
+            w(&infos[0], false, true),   // token
+            w(&infos[1], false, false),  // token_owner
+            w(&infos[2], false, true),   // destination_token
+            w(&infos[3], false, false),  // destination_owner
+            w(&infos[4], false, false),  // mint
+            w(&infos[5], false, true),   // metadata
+            w(&infos[6], false, false),  // edition
+            w(&infos[7], false, true),   // token_record
+            w(&infos[8], false, true),   // destination_token_record
+            w(&infos[9], true, false),   // authority (the vault PDA)
+            w(&infos[10], true, true),   // payer
+            w(&infos[11], false, false), // system_program
+            w(&infos[12], false, false), // sysvar_instructions
+            w(&infos[13], false, false), // spl_token_program
+            w(&infos[14], false, false), // spl_ata_program
+            w(&infos[15], false, false), // authorization_rules_program
+            w(&infos[16], false, false), // authorization_rules
+        ];
+        // Transfer (49), TransferArgs::V1 { amount: 1, authorization_data: None }.
+        let mut data = vec![49u8, 0u8];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.push(0);
+        let ix = anchor_lang::solana_program::instruction::Instruction { program_id: tm, accounts, data };
+        anchor_lang::solana_program::program::invoke_signed(&ix, &infos, &[seeds])?;
 
         let request = &mut ctx.accounts.request;
         request.executed = true;
@@ -865,6 +968,73 @@ pub struct ConfirmTokenWithdrawal<'info> {
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+}
+
+/// Metaplex Token Metadata.
+pub const TOKEN_METADATA_ID: Pubkey = anchor_lang::prelude::pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+
+#[derive(Accounts)]
+pub struct ConfirmPnftWithdrawal<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(has_one = owner)]
+    pub vault: Account<'info, Vault>,
+
+    #[account(
+        seeds = [SecurityExtension::SEED_PREFIX, vault.key().as_ref()],
+        bump = extension.bump,
+    )]
+    pub extension: Account<'info, SecurityExtension>,
+
+    #[account(
+        mut,
+        seeds = [WithdrawalRequest::SEED_PREFIX, extension.key().as_ref(), &request.id.to_le_bytes()],
+        bump = request.bump,
+    )]
+    pub request: Account<'info, WithdrawalRequest>,
+
+    #[account(
+        seeds = [AllowlistEntry::SEED_PREFIX, extension.key().as_ref(), to.key().as_ref()],
+        bump = allowlist.bump,
+    )]
+    pub allowlist: Account<'info, AllowlistEntry>,
+
+    /// CHECK: recipient wallet; checked in the instruction (system-owned, matches the request).
+    pub to: UncheckedAccount<'info>,
+
+    /// CHECK: the pNFT mint; matches the request. Token Metadata checks it is programmable.
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: the vault's associated token account; address checked in the instruction.
+    #[account(mut)]
+    pub vault_token_account: UncheckedAccount<'info>,
+    /// CHECK: the recipient's associated token account; address checked (Token Metadata creates it).
+    #[account(mut)]
+    pub destination_token_account: UncheckedAccount<'info>,
+    /// CHECK: metadata PDA; address checked.
+    #[account(mut)]
+    pub metadata: UncheckedAccount<'info>,
+    /// CHECK: master edition PDA; address checked.
+    pub edition: UncheckedAccount<'info>,
+    /// CHECK: token record of the vault's account; address checked.
+    #[account(mut)]
+    pub token_record: UncheckedAccount<'info>,
+    /// CHECK: token record of the recipient's account; address checked.
+    #[account(mut)]
+    pub destination_token_record: UncheckedAccount<'info>,
+    /// CHECK: the instructions sysvar.
+    #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub sysvar_instructions: UncheckedAccount<'info>,
+    /// CHECK: Token Metadata.
+    #[account(address = TOKEN_METADATA_ID)]
+    pub token_metadata_program: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: the rule set program, when the collection has a rule set (Token Metadata checks it).
+    pub authorization_rules_program: Option<UncheckedAccount<'info>>,
+    /// CHECK: the collection's rule set (Token Metadata checks it against the metadata).
+    pub authorization_rules: Option<UncheckedAccount<'info>>,
 }
 
 /// A guard key acting on the extension (it signs and pays; no owner involved).
