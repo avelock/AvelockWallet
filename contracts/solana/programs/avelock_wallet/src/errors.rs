@@ -61,4 +61,6 @@ pub enum AvelockError {
     AlreadyQueued,
     #[msg("This change waited too long and expired; queue it again.")]
     ChangeExpired,
+    #[msg("This token cannot be withdrawn by the vault (transfer hook or non-transferable).")]
+    UnsupportedAsset,
 }

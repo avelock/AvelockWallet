@@ -484,4 +484,94 @@ describe('AvelockWallet (Solana)', function () {
     expect(reqAfter.executed).to.be.true;
     expect(reqAfter.mint?.equals(mint)).to.be.true;
   });
+
+  /** Request then confirm a token withdrawal of `amount` with `tokenProgram`; returns the destination ATA. */
+  async function tokenWithdrawal(owner: Keypair, vault: PublicKey, extension: PublicKey, mint: PublicKey, tokenProgram: PublicKey, dest: PublicKey, entry: PublicKey, amount: bigint) {
+    const ext = L.decodeSecurityExtension(await fetchAccount(extension));
+    const [request] = L.requestPda(PROGRAM_ID, extension, ext.nextRequestId);
+    await send([new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        meta(owner.publicKey, true, true), meta(vault, false, false), meta(extension, false, true),
+        meta(dest, false, false), meta(entry, false, false), meta(mint, false, false),
+        meta(request, false, true), meta(SystemProgram.programId, false, false),
+      ],
+      data: L.ixAmountOnly('request_token_withdrawal', amount),
+    })], [owner]);
+    await new Promise(r => setTimeout(r, (Number(DEFAULT_DELAYS.withdrawalDelay) + 2) * 1000));
+    const vaultAta = getAssociatedTokenAddressSync(mint, vault, true, tokenProgram);
+    const destAta = getAssociatedTokenAddressSync(mint, dest, false, tokenProgram);
+    await send([new TransactionInstruction({
+      programId: PROGRAM_ID,
+      keys: [
+        meta(owner.publicKey, true, true), meta(vault, false, false), meta(extension, false, false),
+        meta(request, false, true), meta(entry, false, false), meta(dest, false, false),
+        meta(mint, false, false), meta(vaultAta, false, true), meta(destAta, false, true),
+        meta(tokenProgram, false, false), meta(ASSOCIATED_TOKEN_PROGRAM_ID, false, false),
+        meta(SystemProgram.programId, false, false),
+      ],
+      data: L.ixNoArgs('confirm_token_withdrawal'),
+    })], [owner]);
+    return destAta;
+  }
+
+  it('Token-2022 lifecycle: a Token-2022 token leaves the vault after the delay (round2 M-2)', async () => {
+    const spl = await import('@solana/spl-token');
+    const owner = Keypair.generate();
+    await airdrop(owner.publicKey);
+    const { vault, extension } = await initializeVault(owner, { ...DEFAULT_DELAYS, confirmationWindow: 20n });
+    await send([SystemProgram.transfer({ fromPubkey: owner.publicKey, toPubkey: vault, lamports: 1_000_000_000 })], [owner]);
+    const auth = Keypair.generate();
+    await airdrop(auth.publicKey);
+    const mint = await createMint(connection, auth, auth.publicKey, null, 6, undefined, undefined, spl.TOKEN_2022_PROGRAM_ID);
+    const vaultAta = getAssociatedTokenAddressSync(mint, vault, true, spl.TOKEN_2022_PROGRAM_ID);
+    await send([spl.createAssociatedTokenAccountInstruction(auth.publicKey, vaultAta, vault, mint, spl.TOKEN_2022_PROGRAM_ID)], [auth]);
+    await mintTo(connection, auth, mint, vaultAta, auth, 5_000_000, [], undefined, spl.TOKEN_2022_PROGRAM_ID);
+    const dest = Keypair.generate();
+    await airdrop(dest.publicKey);
+    const entry = await addAllowedAddress(owner, vault, extension, dest.publicKey);
+    await new Promise(r => setTimeout(r, (Number(DEFAULT_DELAYS.addressDelay) + 2) * 1000));
+    const destAta = await tokenWithdrawal(owner, vault, extension, mint, spl.TOKEN_2022_PROGRAM_ID, dest.publicKey, entry, 1_250_000n);
+    expect((await getAccount(connection, destAta, 'confirmed', spl.TOKEN_2022_PROGRAM_ID)).amount).to.equal(1_250_000n);
+    expect((await getAccount(connection, vaultAta, 'confirmed', spl.TOKEN_2022_PROGRAM_ID)).amount).to.equal(3_750_000n);
+  });
+
+  it('a non-transferable Token-2022 mint is refused at request time, not after the delay', async () => {
+    const spl = await import('@solana/spl-token');
+    const owner = Keypair.generate();
+    await airdrop(owner.publicKey);
+    const { vault, extension } = await initializeVault(owner);
+    const auth = Keypair.generate();
+    await airdrop(auth.publicKey);
+    const mint = Keypair.generate();
+    const space = spl.getMintLen([spl.ExtensionType.NonTransferable]);
+    await send([
+      SystemProgram.createAccount({ fromPubkey: auth.publicKey, newAccountPubkey: mint.publicKey, space, lamports: await connection.getMinimumBalanceForRentExemption(space), programId: spl.TOKEN_2022_PROGRAM_ID }),
+      spl.createInitializeNonTransferableMintInstruction(mint.publicKey, spl.TOKEN_2022_PROGRAM_ID),
+      spl.createInitializeMintInstruction(mint.publicKey, 0, auth.publicKey, null, spl.TOKEN_2022_PROGRAM_ID),
+    ], [auth, mint]);
+    const dest = Keypair.generate().publicKey;
+    const entry = await addAllowedAddress(owner, vault, extension, dest);
+    await new Promise(r => setTimeout(r, (Number(DEFAULT_DELAYS.addressDelay) + 2) * 1000));
+    const ext = L.decodeSecurityExtension(await fetchAccount(extension));
+    const [request] = L.requestPda(PROGRAM_ID, extension, ext.nextRequestId);
+    let failed = false;
+    try {
+      await send([new TransactionInstruction({
+        programId: PROGRAM_ID,
+        keys: [
+          meta(owner.publicKey, true, true), meta(vault, false, false), meta(extension, false, true),
+          meta(dest, false, false), meta(entry, false, false), meta(mint.publicKey, false, false),
+          meta(request, false, true), meta(SystemProgram.programId, false, false),
+        ],
+        data: L.ixAmountOnly('request_token_withdrawal', 1n),
+      })], [owner]);
+    } catch (e: any) {
+      failed = true;
+      const text = String(e?.message ?? e) + JSON.stringify(e?.logs ?? (await e?.getLogs?.(connection).catch(() => [])) ?? []);
+      expect(text).to.match(/UnsupportedAsset/);
+    }
+    expect(failed, 'a non-transferable mint must be refused').to.be.true;
+    expect(await connection.getAccountInfo(request)).to.be.null;
+  });
 });

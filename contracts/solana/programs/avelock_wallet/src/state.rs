@@ -302,8 +302,8 @@ impl AllowlistEntry {
 
 /// Mirrors `WithdrawalRequest`/`requestEpoch`/`assetKind`/`tokenId`. On
 /// Solana a fungible token and a legacy NFT are both classic SPL mints (an
-/// NFT is a mint with supply 1 and 0 decimals; Token-2022, programmable,
-/// compressed and Core assets are not supported, round2 M-2), so — unlike the EVM side,
+/// NFT is a mint with supply 1 and 0 decimals; classic SPL or Token-2022;
+/// programmable, compressed and Core assets are not supported, round2 M-2), so — unlike the EVM side,
 /// which needs a separate `requestNFTWithdrawal` and an
 /// ERC-20/721/1155 discriminant — one `mint: Option<Pubkey>` field
 /// covers native SOL (`None`) and any SPL asset (`Some`) uniformly.

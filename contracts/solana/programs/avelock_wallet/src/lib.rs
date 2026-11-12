@@ -13,7 +13,9 @@
 // Localnet integration tests (tests/*.spec.ts) need an SBF build; see README.md.
 
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+// Both token programs (round2 M-2): classic SPL Token and Token-2022.
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
+use anchor_spl::token_2022::spl_token_2022::{self, extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions}};
 use anchor_spl::associated_token::AssociatedToken;
 
 pub mod errors;
@@ -251,6 +253,8 @@ pub mod avelock_wallet {
         let now = Clock::get()?.unix_timestamp;
         require!(ctx.accounts.allowlist.is_active(&ctx.accounts.extension, now), AvelockError::DestinationNotAllowed);
         let mint = ctx.accounts.mint.as_ref().ok_or(AvelockError::AssetMismatch)?;
+        // Refused here, not after the whole delay: assets this path can never move.
+        require_withdrawable_mint(&mint.to_account_info())?;
 
         let extension = &mut ctx.accounts.extension;
         let request = &mut ctx.accounts.request;
@@ -311,7 +315,7 @@ pub mod avelock_wallet {
             require!(request.mint.is_none(), AvelockError::NotNativeRequest);
             // SOL sent to an account of this program or a token account is stranded (round2 L-7).
             let to_owner = *ctx.accounts.to.owner;
-            require!(to_owner != crate::ID && to_owner != token::ID, AvelockError::InvalidDestination);
+            require!(to_owner != crate::ID && to_owner != anchor_spl::token::ID && to_owner != spl_token_2022::ID, AvelockError::InvalidDestination);
             require!(
                 ctx.accounts.allowlist.is_active(extension, now)
                     && ctx.accounts.allowlist.epoch == request.epoch_at_request,
@@ -335,9 +339,13 @@ pub mod avelock_wallet {
         Ok(())
     }
 
-    /// Classic SPL-token path: fungible tokens and legacy NFTs (a mint with
-    /// supply 1 / 0 decimals).
-    /// Only classic SPL tokens in the vault's associated token account and legacy NFTs can leave: Token-2022 tokens, programmable NFTs (frozen token account), compressed NFTs, Metaplex Core assets and tokens in a non-associated account sent to the vault are stuck for good (round2 M-2).
+    /// Token path for both token programs: classic SPL Token and Token-2022
+    /// (round2 M-2), fungible tokens and legacy NFTs (supply 1 / 0 decimals).
+    /// Token-2022 mints with a transfer hook or marked non-transferable are
+    /// refused at request time; with a transfer fee, the recipient gets the
+    /// amount less the issuer's fee. Still stuck: programmable NFTs (frozen
+    /// token account), compressed NFTs, Metaplex Core assets, and tokens in a
+    /// non-associated account sent to the vault.
     /// The destination token account is the recipient's own associated
     /// token account for this mint, derived and constraint-checked by
     /// Anchor — there is no arbitrary "which contract receives it"
@@ -373,8 +381,9 @@ pub mod avelock_wallet {
         let signer: &[&[&[u8]]] = &[seeds];
 
         let amount = ctx.accounts.request.amount;
-        let cpi_accounts = Transfer {
+        let cpi_accounts = TransferChecked {
             from: ctx.accounts.vault_token_account.to_account_info(),
+            mint: ctx.accounts.mint.to_account_info(),
             to: ctx.accounts.destination_token_account.to_account_info(),
             authority: ctx.accounts.vault.to_account_info(),
         };
@@ -383,7 +392,8 @@ pub mod avelock_wallet {
             cpi_accounts,
             signer,
         );
-        token::transfer(cpi_ctx, amount)?;
+        // Checked: the mint's decimals are part of the transfer (Token-2022 requires it).
+        token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.mint.decimals)?;
 
         let request = &mut ctx.accounts.request;
         request.executed = true;
@@ -732,7 +742,7 @@ pub struct RequestWithdrawal<'info> {
     /// Anchor's current client-side convention for omitting an Option
     /// account against whatever `anchor-lang` version this ends up
     /// pinned to before relying on it.
-    pub mint: Option<Account<'info, Mint>>,
+    pub mint: Option<InterfaceAccount<'info, Mint>>,
 
     #[account(
         init,
@@ -831,24 +841,28 @@ pub struct ConfirmTokenWithdrawal<'info> {
     /// `destination_token_account` below, derived from this key.
     pub to: UncheckedAccount<'info>,
 
-    pub mint: Account<'info, Mint>,
+    #[account(mint::token_program = token_program)]
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
 
     #[account(
         mut,
         associated_token::mint = mint,
         associated_token::authority = vault,
+        associated_token::token_program = token_program,
     )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         init_if_needed,
         payer = owner,
         associated_token::mint = mint,
         associated_token::authority = to,
+        associated_token::token_program = token_program,
     )]
-    pub destination_token_account: Box<Account<'info, TokenAccount>>,
+    pub destination_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    pub token_program: Program<'info, Token>,
+    /// The mint's own token program: classic SPL Token or Token-2022.
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -1083,4 +1097,24 @@ mod change_wait_tests {
         assert_eq!(change_wait(3_600, 14 * day), 14 * day);
         assert_eq!(change_wait(30 * day, 7 * day), 30 * day);
     }
+}
+
+/// A mint this program can move out of the vault (round2 M-2). Classic SPL
+/// mints always; Token-2022 mints unless a transfer hook (needs accounts this
+/// path does not pass, and the issuer's program decides) or non-transferable.
+fn require_withdrawable_mint(mint: &AccountInfo) -> Result<()> {
+    if *mint.owner == anchor_spl::token::ID {
+        return Ok(());
+    }
+    require_keys_eq!(*mint.owner, spl_token_2022::ID, AvelockError::UnsupportedAsset);
+    let data = mint.try_borrow_data()?;
+    let state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&data).map_err(|_| error!(AvelockError::UnsupportedAsset))?;
+    let types = state.get_extension_types().map_err(|_| error!(AvelockError::UnsupportedAsset))?;
+    for t in types {
+        require!(
+            !matches!(t, ExtensionType::TransferHook | ExtensionType::NonTransferable),
+            AvelockError::UnsupportedAsset
+        );
+    }
+    Ok(())
 }
