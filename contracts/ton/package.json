@@ -13,7 +13,7 @@
         "@ton/core": "~0"
     },
     "devDependencies": {
-        "@tact-lang/compiler": ">=1.6.13 <2.0.0",
+        "@tact-lang/compiler": "1.6.13",
         "@ton-community/func-js": ">=0.10.0",
         "@ton/blueprint": "^0.46.0",
         "@ton/crypto": "^3.3.0",

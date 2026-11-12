@@ -6,7 +6,7 @@ import { createVault, Vault } from '../src/vault';
 import { buildCosignedSpend, buildSpend, finalizeCosignedSpend, finalizeSpend, signSpend, Signer, VaultUtxo } from '../src/spend';
 import { taprootSigner } from '../src/keys';
 import { heirKey, ownerAccountXpub, ownerKey } from '../src/mnemonicKeys';
-import { Operation, Policy, signOperation, VaultConfig } from '../src/signer/messages';
+import { Operation, Policy, signOperation, signRead, VaultConfig } from '../src/signer/messages';
 import { MAX_PENDING_REQUESTS, postSos, REFRESH_INTERVAL, SignerService, SOS_INTERVAL, SosPayload } from '../src/signer/service';
 import { createServer } from 'http';
 import { AddressInfo } from 'net';
@@ -70,7 +70,7 @@ describe('Bitcoin signer', () => {
     destination = await node.rpc('getnewaddress', ['', 'bech32m'], 'miner');
     attacker = await node.rpc('getnewaddress', ['', 'bech32m'], 'miner');
     signer = new SignerService({
-      key: signerKey, network, networkName: 'regtest', now: () => clock, onDuress: a => duressCalls.push(a),
+      key: signerKey, network, networkName: 'regtest', now: () => clock, opsPerHour: 10_000, onDuress: a => duressCalls.push(a),
       sendSos: (url, payload) => sosCalls.push({ url, payload }),
     });
     config = { generation: 0, owner: hex(owner), signers: [signer.publicKey], threshold: 1, reserveBlocks: RESERVE, heir: hex(heir), heirBlocks: 2 * RESERVE };
@@ -206,9 +206,46 @@ describe('Bitcoin signer', () => {
     const target = createVault({ owner: next.publicKey, signers: [signerKey.publicKey], threshold: 1, reserveBlocks: RESERVE, heir: heir.publicKey, heirBlocks: 2 * RESERVE, network });
     const utxo = await node.fund(vault.address, 100_000);
     const psbt = withdrawalPsbt(utxo, [{ address: target.address, value: 100_000 - FEE }]);
-    expect(() => signer.signRefresh(hex(owner), head(), psbt)).toThrow(/one per day/);
+    const out = bitcoin.Psbt.fromBase64(signer.signRefresh(hex(owner), head(), psbt), { network });
+    // The coin it made is not renewed again within a day (round2 H-2: per coin, not per account).
+    const made = { txid: bitcoin.Transaction.fromBuffer(out.data.globalMap.unsignedTx.toBuffer()).getId(), vout: 0, value: 100_000 - FEE };
+    const again = buildSpend(target, 'cosigned', [made], [{ address: target.address, value: made.value - FEE }], signerKey.publicKey);
+    signSpend(again, next);
+    expect(() => signer.signRefresh(hex(owner), head(), again.toBase64())).toThrow(/renewed recently/);
     clock += REFRESH_INTERVAL;
-    expect(() => signer.signRefresh(hex(owner), head(), psbt)).not.toThrow();
+    expect(() => signer.signRefresh(hex(owner), head(), again.toBase64())).not.toThrow();
+    // Splitting coins is refused: it would multiply the fee cap.
+    const split = withdrawalPsbt(await node.fund(vault.address, 100_000), [{ address: target.address, value: 40_000 }, { address: target.address, value: 60_000 - FEE }]);
+    expect(() => signer.signRefresh(hex(owner), head(), split)).toThrow(/more coins than it spends/);
+  });
+
+  it('dust inputs do not let a refresh split a coin, and refresh fees have a day budget (REVIEW_last3days #1)', async () => {
+    clock += 2 * REFRESH_INTERVAL;
+    const target = createVault({ owner: ownerKey(mnemonic, network, 1).publicKey, signers: [signerKey.publicKey], threshold: 1, reserveBlocks: RESERVE, heir: heir.publicKey, heirBlocks: 2 * RESERVE, network });
+    const many = (utxos: VaultUtxo[], outputs: { address: string; value: number }[]) => {
+      const psbt = buildSpend(vault, 'cosigned', utxos, outputs, signerKey.publicKey);
+      signSpend(psbt, owner);
+      return psbt.toBase64();
+    };
+    // One real coin plus two dust coins may not become three large coins.
+    const big = await node.fund(vault.address, 100_000);
+    const dust = [await node.fund(vault.address, 600), await node.fund(vault.address, 600)];
+    const split = many([big, ...dust], [30_000, 30_000, 41_200 - FEE].map(value => ({ address: target.address, value })));
+    expect(() => signer.signRefresh(hex(owner), head(), split)).toThrow(/at most one coin above/);
+    // Small coins kept apart (inscriptions) are still fine.
+    expect(() => signer.signRefresh(hex(owner), head(), many([...dust, big], [{ address: target.address, value: 600 }, { address: target.address, value: 600 }, { address: target.address, value: 100_000 - FEE }]))).not.toThrow();
+    // Each refresh may pay up to maxFee, but all of a day's together at most twice that.
+    const fee = 10_000; // maxFee; the refresh above paid FEE
+    const one = async () => many([await node.fund(vault.address, 100_000)], [{ address: target.address, value: 100_000 - fee }]);
+    signer.signRefresh(hex(owner), head(), await one());
+    const third = await one();
+    expect(() => signer.signRefresh(hex(owner), head(), third)).toThrow(/fees for today are used up/);
+    clock += REFRESH_INTERVAL + 1;
+    expect(() => signer.signRefresh(hex(owner), head(), third)).not.toThrow();
+    // The bookkeeping stays inside the signer.
+    const read = signer.getAccount(hex(owner))!;
+    expect(read.refreshFees!.length).toBe(1);
+    expect(Object.keys(signer.readAccount(signRead({ domain: signer.domain, account: hex(owner), expiresAt: clock + 60, operation: { op: 'read' } }, owner))).some(k => /stopSeen|refreshedCoins|refreshFees/.test(k))).toBe(false);
   });
 
   it('a withdrawal can combine coins from several generations', async () => {
@@ -245,7 +282,10 @@ describe('Bitcoin signer', () => {
     expect(() => op({ op: 'applyPolicyChange' }, { nonce })).toThrow(/not elapsed/);
     // A "stronger" change (longer delays, zero fee cap, 1-second window) must not
     // apply at once: instantly it would let a thief lock the owner out.
-    const lockout = { ...policy, withdrawalDelay: 90 * DAY, addressDelay: 90 * DAY, confirmationWindow: 1, maxFee: 0 };
+    // Values that would trap the owner are refused outright (round2 L-5).
+    expect(() => op({ op: 'changePolicy', policy: { ...policy, confirmationWindow: 1 } }, { nonce })).toThrow(/confirmationWindow/);
+    expect(() => op({ op: 'changePolicy', policy: { ...policy, maxFee: 0 } }, { nonce })).toThrow(/maxFee/);
+    const lockout = { ...policy, withdrawalDelay: 90 * DAY, addressDelay: 90 * DAY, confirmationWindow: 3600, maxFee: 1_000 };
     expect(op({ op: 'changePolicy', policy: lockout })).toMatchObject({ applied: false });
     expect(signer.getAccount(hex(owner))!.policy).toEqual(policy);
     // Changing the heir key waits too.
@@ -288,15 +328,21 @@ describe('Bitcoin signer', () => {
   });
 
   it('rejects replayed, expired, foreign-signed and out-of-order operations', () => {
-    const body = { domain: signer.domain, account: hex(owner), nonce, expiresAt: clock + 600, head: head(), operation: { op: 'cancelPolicyChange' } as Operation };
+    // Ordinary operations are bound to the nonce and head; stop operations are
+    // bound by their digest instead (round2 H-1): either way a replay fails.
+    const body = { domain: signer.domain, account: hex(owner), nonce, expiresAt: clock + 600, head: head(), operation: { op: 'addAddress', address: attacker } as Operation };
     const signed = signOperation(body, owner);
     signer.submit(signed);
     nonce++;
     expect(() => signer.submit(signed)).toThrow(/nonce|head/);
+    const stop = signOperation({ domain: signer.domain, account: hex(owner), nonce, expiresAt: clock + 600, head: head(), operation: { op: 'cancelPolicyChange' } as Operation }, owner);
+    signer.submit(stop);
+    nonce++;
+    expect(() => signer.submit(stop)).toThrow(/already applied/);
     expect(() => op({ op: 'cancelPolicyChange' }, { nonce, expiresAt: clock - 1 })).toThrow(/expired/);
     expect(() => op({ op: 'cancelPolicyChange' }, { nonce, expiresAt: clock + 7200 })).toThrow(/expired/);
     expect(() => op({ op: 'cancelPolicyChange' }, { nonce, key: randomKey() })).toThrow(/signature/);
-    expect(() => op({ op: 'cancelPolicyChange' }, { nonce: nonce + 5 })).toThrow(/nonce/);
+    expect(() => op({ op: 'addAddress', address: destination }, { nonce: nonce + 5 })).toThrow(/nonce/);
   });
 
   it('detects a signer restored from an old backup (rollback)', () => {
@@ -307,7 +353,7 @@ describe('Bitcoin signer', () => {
     expect(latest).not.toBe(clientHead);
     // The server is restored from the backup: the removal is "forgotten".
     const restored = new SignerService({ key: signerKey, network, networkName: 'regtest', now: () => clock, state: backup });
-    const body = { domain: restored.domain, account: hex(owner), nonce: restored.getAccount(hex(owner))!.nonce, expiresAt: clock + 600, head: latest, operation: { op: 'cancelPolicyChange' } as Operation };
+    const body = { domain: restored.domain, account: hex(owner), nonce: restored.getAccount(hex(owner))!.nonce, expiresAt: clock + 600, head: latest, operation: { op: 'addAddress', address: destination } as Operation };
     expect(() => restored.submit(signOperation(body, owner))).toThrow(/head mismatch/);
   });
 
@@ -415,7 +461,8 @@ describe('Bitcoin signer', () => {
     expect(op({ op: 'changePolicy', policy: { ...policy, heir: null } })).toMatchObject({ applied: false });
     clock += policy.policyDelay + 1;
     op({ op: 'applyPolicyChange' });
-    const k = { generation: 30, owner: hex(ownerKey(mnemonic, network, 30)) };
+    const n30 = Math.max(...signer.getAccount(hex(owner))!.generations.map(g => g.generation)) + 1; // the next one (round2 M-2)
+    const k = { generation: n30, owner: hex(ownerKey(mnemonic, network, n30)) };
     const { heir: _h, heirBlocks: _b, ...heirless } = config;
     expect(op({ op: 'addGeneration', vault: { ...heirless, ...k } })).toHaveProperty('address');
   });
@@ -430,10 +477,11 @@ describe('Bitcoin signer', () => {
   it('adds at most one generation a day, so the generation limit cannot be filled at once', () => {
     clock += 2 * DAY;
     const gen = (i: number) => ({ ...config, generation: i, owner: hex(ownerKey(mnemonic, network, i)) });
-    const { heir: _h, heirBlocks: _b, ...rest } = gen(50);
-    const current = signer.getAccount(hex(owner))!.policy.heir === null ? rest : gen(50);
+    const n50 = Math.max(...signer.getAccount(hex(owner))!.generations.map(g => g.generation)) + 1; // the next one (round2 M-2)
+    const { heir: _h, heirBlocks: _b, ...rest } = gen(n50);
+    const current = signer.getAccount(hex(owner))!.policy.heir === null ? rest : gen(n50);
     expect(op({ op: 'addGeneration', vault: current })).toHaveProperty('address');
-    const next = { ...current, generation: 51, owner: hex(ownerKey(mnemonic, network, 51)) };
+    const next = { ...current, generation: n50 + 1, owner: hex(ownerKey(mnemonic, network, n50 + 1)) };
     expect(() => op({ op: 'addGeneration', vault: next }, { nonce })).toThrow(/one new vault generation per day/);
     clock += DAY;
     expect(op({ op: 'addGeneration', vault: next })).toHaveProperty('address');

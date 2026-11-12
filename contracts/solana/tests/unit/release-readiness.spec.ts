@@ -1,6 +1,6 @@
 import {expect} from 'chai';
 import {PublicKey} from '@solana/web3.js';
-import {programDataAddress, Snapshot, UPGRADEABLE_LOADER, verifyAcrossRpcs, verifyReleaseReadiness} from '../../scripts/release-readiness';
+import {programDataAddress, Snapshot, UPGRADEABLE_LOADER, verifyAcrossRpcs, verifyReleaseReadiness, assertDistinctRpcs, assertNoIdlInstructions} from '../../scripts/release-readiness';
 
 const programId = new PublicKey(Buffer.alloc(32, 7));
 // Synthetic fixture, never deployed or executed.
@@ -78,5 +78,12 @@ describe('release readiness across RPCs (A6-H3)', () => {
     expect(() => across([snapshot(), bad])).to.throw('Upgrade authority');
     const other = snapshot(); other.programData!.data.writeBigUInt64LE(124n, 4);
     expect(() => across([snapshot(), other])).to.throw('disagree');
+  });
+
+  it('refuses the same RPC host twice and an image with IDL instructions (round2 L-6, L-1)', () => {
+    expect(() => assertDistinctRpcs(['https://a.example/x', 'https://A.example/y'])).to.throw();
+    assertDistinctRpcs(['https://a.example', 'https://b.example']);
+    expect(() => assertNoIdlInstructions(Buffer.from('xx Instruction: IdlCreateAccount xx'))).to.throw();
+    assertNoIdlInstructions(Buffer.from('clean'));
   });
 });

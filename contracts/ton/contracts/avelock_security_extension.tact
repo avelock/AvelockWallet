@@ -8,7 +8,9 @@ asm fun chainGlobalId(): Int { GLOBALID }
 // AvelockSecurityExtension — TON port of the EVM AvelockSecurityExtension.
 // Same state machine: request -> delay -> confirm -> execute withdrawals,
 // an address allowlist with its own activation delay, a Security Policy
-// Delay gating any weakening parameter change, and immutable minimums
+// Delay gating every parameter change (raising a delay waits too, as on
+// EVM: one rule for all changes, and a guard may cancel either; round2
+// L-5), and immutable minimums
 // that no owner action can ever go below.
 //
 // Unlike the EVM version (where the extension is msg.sender-checked
@@ -56,6 +58,10 @@ message(0x47554104) GuardDropPendingGuard {
     guard: Address;
 }
 message(0x47554105) GuardLock {}
+// A guard cancels an asset registration that is still waiting (round2 L-3).
+message(0x47554106) GuardCancelPendingAsset {
+    asset: Address;
+}
 
 struct GuardState {
     activeAt: Int as uint32;
@@ -89,6 +95,8 @@ struct WithdrawalRequest {
     // Native TON only: send bounceable (safe default) or not. Asset hops
     // always go to a deployed jetton-wallet/NFT item and stay bounceable.
     bounceable: Bool;
+    // TON sent with a jetton/NFT hop (round2 L-2): 0.05 by default, up to 0.3.
+    hopValue: Int as coins;
 }
 
 // Owner-approved transfer targets, separate from payment destinations.
@@ -118,6 +126,7 @@ const OP_APPLY_PARAM_CHANGE: Int = 9;
 const OP_CANCEL_PARAM_CHANGE: Int = 10;
 const OP_SET_CONFIRMATION_WINDOW: Int = 11;
 const OP_PRUNE_REQUEST: Int = 12;
+const OPERATION_RESULTS: Int = 8;
 const OP_PROPOSE_OWNER_ROTATION: Int = 13;
 const OP_APPLY_OWNER_ROTATION: Int = 14;
 const OP_CANCEL_OWNER_ROTATION: Int = 15;
@@ -167,6 +176,9 @@ contract AvelockSecurityExtension {
     // Signed operations that were accepted (nonce consumed) but failed.
     lastFailedOperationHash: Int as uint256 = 0;
     lastFailureCode: Int as int32 = 0;
+    // Result of each of the last OPERATION_RESULTS signed operations, by
+    // seqno: 0 = done, else the failure code (round2 L-4).
+    operationResults: map<Int as uint32, Int as int32>;
     ownerPublicKey: Int as uint256;
     networkGlobalId: Int as int32;
     requestOperation: map<Int as uint64, Int as uint32>;
@@ -345,6 +357,10 @@ contract AvelockSecurityExtension {
                 throwUnless(69, c.bits() == 0 || c.preloadUint(8) != 0);
             }
             let bounceable: Bool = msg.loadBool();
+            // Optional, signed: a larger budget for an asset hop (round2 L-2).
+            let hopValue: Int = ton("0.05");
+            if (msg.bits() > 0) { hopValue = msg.loadCoins(); }
+            throwUnless(61, hopValue >= ton("0.05") && hopValue <= ton("0.3"));
             // Non-bounceable delivery is only meaningful for native TON.
             throwUnless(70, bounceable || assetKind == ASSET_NATIVE);
             throwUnless(61, assetKind <= ASSET_NFT && (assetKind == ASSET_NFT || amount > 0));
@@ -370,6 +386,7 @@ contract AvelockSecurityExtension {
                 submitted: false,
                 failed: false,
                 cancelled: false,
+                hopValue: hopValue,
                 comment: comment,
                 bounceable: bounceable,
             });
@@ -379,7 +396,7 @@ contract AvelockSecurityExtension {
         } else if (op == OP_CANCEL_WITHDRAWAL) {
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
-            throwUnless(53, !req.submitted && !req.cancelled);
+            throwUnless(53, !req.cancelled && (!req.submitted || req.failed)); // a failed send moved nothing (round2 M-1)
             req.cancelled = true;
             self.requests.set(requestId, req);
         } else if (op == OP_PRUNE_REQUEST) {
@@ -392,6 +409,9 @@ contract AvelockSecurityExtension {
             let retentionOk: Bool = req.cancelled || annulled || now() > req.expiresAt + REQUEST_RETENTION;
             throwUnless(66, terminal && retentionOk);
             if (req.submitted) {
+                // Same floor as confirm (MEGA_AUDIT ton_02 F4): the send must not
+                // fail in the action phase, which would undo the consumed nonce.
+                throwUnless(64, myBalance() >= ton("0.07"));
                 send(SendParameters{
                     to: self.walletAddress, value: ton("0.01"), mode: SendPayGasSeparately,
                     body: PruneCorrelation{ requestId: requestId }.toCell(),
@@ -406,9 +426,9 @@ contract AvelockSecurityExtension {
             self.requestLockEpoch.set(requestId, null);
         } else if (op == OP_CONFIRM_WITHDRAWAL) {
             throwUnless(71, !self.locked);
-            throwUnless(64, myBalance() >= ton("0.07"));
             let requestId: Int = msg.loadUint(64);
             let req: WithdrawalRequest = self.requests.get(requestId)!!;
+            throwUnless(64, myBalance() >= ton("0.02") + req.hopValue);
             throwUnless(53, !req.submitted && !req.cancelled);
             throwUnless(72, !self.isRequestAnnulled(requestId));
             throwUnless(54, now() >= req.availableAt);
@@ -470,9 +490,9 @@ contract AvelockSecurityExtension {
                     to: self.walletAddress,
                     // 0.05 is forwarded to the jetton wallet / NFT item (the
                     // standard transfer budget), ~0.001 is the wallet's own gas.
-                    value: ton("0.06"),
+                    value: req.hopValue + ton("0.01"),
                     mode: SendPayGasSeparately,
-                    body: ExecuteFromExtension{ requestId: requestId, to: req.jettonWallet!!, amount: ton("0.05"), body: jettonBody, bounce: true }.toCell(),
+                    body: ExecuteFromExtension{ requestId: requestId, to: req.jettonWallet!!, amount: req.hopValue, body: jettonBody, bounce: true }.toCell(),
                 });
             } else {
                 // NFTs (TEP-62): unlike jettons, the wallet holds the item
@@ -496,9 +516,9 @@ contract AvelockSecurityExtension {
                     to: self.walletAddress,
                     // 0.05 is forwarded to the jetton wallet / NFT item (the
                     // standard transfer budget), ~0.001 is the wallet's own gas.
-                    value: ton("0.06"),
+                    value: req.hopValue + ton("0.01"),
                     mode: SendPayGasSeparately,
-                    body: ExecuteFromExtension{ requestId: requestId, to: req.nftItemAddress!!, amount: ton("0.05"), body: nftBody, bounce: true }.toCell(),
+                    body: ExecuteFromExtension{ requestId: requestId, to: req.nftItemAddress!!, amount: req.hopValue, body: nftBody, bounce: true }.toCell(),
                 });
             }
         } else if (op == OP_SET_WITHDRAWAL_DELAY) {
@@ -543,16 +563,18 @@ contract AvelockSecurityExtension {
             throwUnless(74, self.guards.get(key) == null && self._guardCount() < MAX_GUARDS);
             self.guards.set(key, GuardState{ activeAt: now() + self.addressDelay, removableAt: 0 });
         } else if (op == OP_REMOVE_GUARD) {
-            // A guard still waiting goes at once; an active one waits the
-            // address delay, so a stolen owner key can't quietly drop it.
+            // A guard still waiting goes at once; an active one waits
+            // changeWait() + lockDelay, so a stolen owner key can't quietly
+            // drop it. Allowed during a lock and kept by later locks
+            // (MEGA_AUDIT ton_02 F1, as EVM H01): a rogue guard re-locking
+            // cannot make itself irremovable.
             let key: Address = msg.loadAddress();
             let g: GuardState = self.guards.get(key)!!;
             if (now() < g.activeAt) {
                 self.guards.set(key, null);
-            } else if (g.removableAt == 0) {
-                // Queued only while unlocked; a lock drops it (audit A15-1).
-                throwUnless(71, !self.locked);
-                self.guards.set(key, GuardState{ activeAt: g.activeAt, removableAt: now() + self.addressDelay });
+            } else {
+                throwUnless(75, g.removableAt == 0);
+                self.guards.set(key, GuardState{ activeAt: g.activeAt, removableAt: now() + self.changeWait() + self.lockDelay });
             }
         } else if (op == OP_CANCEL_GUARD_REMOVAL) {
             let key: Address = msg.loadAddress();
@@ -564,9 +586,8 @@ contract AvelockSecurityExtension {
             let g: GuardState = self.guards.get(key)!!;
             throwUnless(75, g.removableAt != 0);
             throwUnless(59, now() >= g.removableAt);
-            // Never during a lock (audit A15-1): else a phrase thief waits out
-            // the guard's lock and no one is left to extend it.
-            throwUnless(71, !self.locked);
+            // Also during a lock (MEGA_AUDIT ton_02 F1): the long wait above is
+            // what holds a phrase thief off, not the lock.
             self.guards.set(key, null);
         } else if (op == OP_LOCK) {
             self._lock();
@@ -577,9 +598,11 @@ contract AvelockSecurityExtension {
             throw(60);
         }
             self.lastOperationHash = operationHash;
+            self._recordResult(0);
         } catch (code) {
             self.lastFailedOperationHash = operationHash;
             self.lastFailureCode = code;
+            self._recordResult(code);
         }
 
     }
@@ -599,7 +622,7 @@ contract AvelockSecurityExtension {
     receive(msg: GuardCancelWithdrawal) {
         throwUnless(76, self.isGuard(sender()));
         let req: WithdrawalRequest = self.requests.get(msg.requestId)!!;
-        throwUnless(53, !req.submitted && !req.cancelled);
+        throwUnless(53, !req.cancelled && (!req.submitted || req.failed)); // round2 M-1
         req.cancelled = true;
         self.requests.set(msg.requestId, req);
     }
@@ -618,6 +641,14 @@ contract AvelockSecurityExtension {
         self.allowlistActiveAt.set(msg.destination, null);
     }
 
+    receive(msg: GuardCancelPendingAsset) {
+        throwUnless(76, self.isGuard(sender()));
+        let asset: AssetRegistration? = self.registeredAssets.get(msg.asset);
+        throwUnless(75, asset != null && now() < asset!!.activeAt);
+        self.assetEpochs.set(msg.asset, self.assetEpoch(msg.asset) + 1);
+        self.registeredAssets.set(msg.asset, null);
+    }
+
     receive(msg: GuardDropPendingGuard) {
         throwUnless(76, self.isGuard(sender()));
         let g: GuardState = self.guards.get(msg.guard)!!;
@@ -631,9 +662,9 @@ contract AvelockSecurityExtension {
     }
 
     // Panic Lock: instant; voids pending requests, destinations and asset
-    // registrations, cancels queued changes, pending guards and queued guard
-    // removals. Locking
-    // again extends it. Only the owner lifts it, after lockDelay.
+    // registrations, cancels queued changes and pending guards. A queued
+    // removal of an active guard stays (MEGA_AUDIT ton_02 F1). Locking again
+    // extends it. Only the owner lifts it, after lockDelay.
     fun _lock() {
         let lockedUntil: Int = now() + self.lockDelay;
         if (self.locked) {
@@ -646,17 +677,11 @@ contract AvelockSecurityExtension {
         self.lockTimes.set(self.lockEpoch, now());
         self.pendingParamChanges = emptyMap();
         let waiting: map<Address, Bool> = emptyMap();
-        let leaving: map<Address, Int> = emptyMap();
         foreach (key, g in self.guards) {
             if (now() < g.activeAt) { waiting.set(key, true); }
-            else if (g.removableAt != 0) { leaving.set(key, g.activeAt); }
         }
         foreach (key, flag in waiting) {
             self.guards.set(key, null);
-        }
-        // A queued removal of an active guard is void too (A15-1).
-        foreach (key, activeAt in leaving) {
-            self.guards.set(key, GuardState{ activeAt: activeAt, removableAt: 0 });
         }
     }
 
@@ -696,6 +721,14 @@ contract AvelockSecurityExtension {
     get fun lastOperationHash(): Int { return self.lastOperationHash; }
     get fun lastFailedOperationHash(): Int { return self.lastFailedOperationHash; }
     get fun lastFailureCode(): Int { return self.lastFailureCode; }
+    // null = unknown (not run yet, or older than the last OPERATION_RESULTS).
+    get fun operationResult(seqno: Int): Int? { return self.operationResults.get(seqno); }
+
+    fun _recordResult(code: Int) {
+        let done: Int = self.seqno - 1;
+        self.operationResults.set(done, code);
+        if (done >= OPERATION_RESULTS) { self.operationResults.set(done - OPERATION_RESULTS, null); }
+    }
 
     // Only a bounce from our wallet proves the first forwarding hop failed.
     bounced(msg: bounced<ExecuteFromExtension>) {
@@ -715,8 +748,12 @@ contract AvelockSecurityExtension {
         return value!!;
     }
 
+    // A registration voided by a lock reads as none, as the contract treats it (round2 M-2).
     get fun assetRegistration(addr: Address): AssetRegistration? {
-        return self.registeredAssets.get(addr);
+        let asset: AssetRegistration? = self.registeredAssets.get(addr);
+        if (asset == null) { return null; }
+        if (self._voidedByLock(self.assetLockEpoch.get(addr), asset!!.activeAt)) { return null; }
+        return asset;
     }
 
     get fun isAssetActive(addr: Address, kind: Int): Bool {
@@ -755,7 +792,7 @@ contract AvelockSecurityExtension {
         }
         self.pendingParamChanges.set(param, PendingParamChange{
             newValue: newValue,
-            effectiveAt: now() + self.changeWait(),
+            effectiveAt: now() + self._waitFor(param, newValue, currentValue),
             exists: true,
         });
     }
@@ -763,6 +800,14 @@ contract AvelockSecurityExtension {
     // A change waits the policy delay, never less than the withdrawal delay
     // (audit A14-2): else a short policy delay lowers the withdrawal delay
     // and a phrase thief withdraws sooner than the owner's delay.
+    // Lowering the address delay waits at least the current one, so a short
+    // policy delay cannot undercut it (same as EVM R2-M01 / Solana M-1).
+    fun _waitFor(param: Int, newValue: Int, currentValue: Int): Int {
+        let wait: Int = self.changeWait();
+        if (param == PARAM_ADDRESS_DELAY && newValue < currentValue && currentValue > wait) { wait = currentValue; }
+        return wait;
+    }
+
     fun changeWait(): Int {
         return max(self.policyDelay, self.withdrawalDelay);
     }
@@ -788,6 +833,8 @@ contract AvelockSecurityExtension {
     get fun addressActiveAt(addr: Address): Int {
         let activeAt: Int? = self.allowlistActiveAt.get(addr);
         if (activeAt == null) { return 0; }
+        // A destination voided by a lock reads as not added (round2 M-2).
+        if (self._voidedByLock(self.allowlistLockEpoch.get(addr), activeAt!!)) { return 0; }
         return activeAt!!;
     }
 

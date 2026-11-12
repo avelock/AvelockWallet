@@ -67,12 +67,21 @@ let cached = null;
 let running = null;
 
 /** The status answer, from a fresh check at most once per STATUS_TTL_MS (per Worker instance). */
-export async function statusResponse(env = {}, fetchUpstream = fetch, now = Date.now) {
+export async function statusResponse(env = {}, fetchUpstream = fetch, now = Date.now, waitUntil = undefined) {
   if (!cached || now() - cached.at >= STATUS_TTL_MS) {
-    running ??= checkAll(env, fetchUpstream, now)
+    let started = false;
+    running ??= (started = true, checkAll(env, fetchUpstream, now)
       .then(result => { cached = { at: now(), body: JSON.stringify(result) }; })
-      .finally(() => { running = null; });
-    await running;
+      .finally(() => { running = null; }));
+    // The check outlives the request that started it (round2 L-2): a client
+    // that drops the connection does not leave it hanging for everyone.
+    if (started) waitUntil?.(running);
+    // Never wait longer than one probe round: past it, the last answer is served.
+    let t;
+    const bound = new Promise(r => { t = setTimeout(r, PROBE_TIMEOUT_MS + 2000); });
+    await Promise.race([running, bound]);
+    clearTimeout(t);
+    if (!cached) return new Response(JSON.stringify({ error: 'status not ready' }), { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '10' } });
   }
   return new Response(cached.body, {
     status: 200,

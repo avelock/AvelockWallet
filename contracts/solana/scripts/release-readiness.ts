@@ -61,6 +61,25 @@ export function verifyReleaseReadiness(
  * one must answer and pass, and all must see the same accounts. Returns
  * the release manifest to compile into the app (src/solana/release.ts).
  */
+const CLUSTERS: Record<string, string> = {
+  '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d': 'mainnet-beta',
+  'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG': 'devnet',
+  '4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY': 'testnet',
+};
+
+/** The same URL or host twice is one operator, not two (round2 L-6). */
+export function assertDistinctRpcs(urls: string[]) {
+  const hosts = urls.map(u => new URL(u).hostname.toLowerCase());
+  if (new Set(hosts).size !== hosts.length) throw new Error('Each RPC must be on a different host.');
+}
+
+/** Anchor's IDL instructions let anyone publish a false IDL for an immutable program (round2 L-1). */
+export function assertNoIdlInstructions(image: Buffer) {
+  if (image.includes('IdlCreateAccount') || image.includes('IdlWrite')) {
+    throw new Error('The image contains Anchor IDL instructions; build with --features no-idl.');
+  }
+}
+
 export function verifyAcrossRpcs(
   programId: PublicKey,
   expectedGenesisHash: string,
@@ -69,6 +88,7 @@ export function verifyAcrossRpcs(
   minRpcs: number,
 ) {
   if (snapshots.length < minRpcs) throw new Error(`At least ${minRpcs} independent RPCs are required.`);
+  assertNoIdlInstructions(reviewedImage);
   const results = snapshots.map(s => verifyReleaseReadiness(programId, expectedGenesisHash, reviewedImage, s));
   const same = (s: Snapshot) => Buffer.concat([s.program!.data, s.programData!.data]);
   if (snapshots.some(s => !same(s).equals(same(snapshots[0])))) throw new Error('The RPCs disagree about the program accounts.');
@@ -76,7 +96,7 @@ export function verifyAcrossRpcs(
     ...results[0],
     rpcs: snapshots.length,
     manifest: {
-      cluster: expectedGenesisHash === '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d' ? 'mainnet-beta' : 'devnet',
+      cluster: CLUSTERS[expectedGenesisHash] ?? 'custom', // not every other hash is devnet (round2 L-6)
       genesisHash: expectedGenesisHash,
       programId: programId.toBase58(),
       image: { sha256: results[0].imageSha256, length: reviewedImage.length },
@@ -89,6 +109,7 @@ async function main() {
   if (args.length < 5)
     throw new Error('Usage: npm run check:release -- <PROGRAM_ID> <EXPECTED_GENESIS_HASH> <REVIEWED_SO_PATH> <RPC_URL> <RPC_URL> [<RPC_URL>...]  (mainnet: at least 3 RPCs from different operators)');
   const [program, genesis, imagePath, ...rpcs] = args;
+  assertDistinctRpcs(rpcs);
   const programId = new PublicKey(program);
   const image = readFileSync(imagePath);
   const snapshots = await Promise.all(rpcs.map(async rpc => {

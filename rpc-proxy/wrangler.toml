@@ -17,3 +17,12 @@ namespace_id = "1001"
   [ratelimits.simple]
   limit = 300
   period = 60
+
+# Shared budget per route across all clients (round2 H-1): many addresses
+# together cannot drain a provider. Sends are never refused by it.
+[[ratelimits]]
+name = "SHARED"
+namespace_id = "1002"
+  [ratelimits.simple]
+  limit = 6000
+  period = 60

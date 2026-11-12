@@ -10,8 +10,7 @@
 // instead of two programs, and why NFTs need no separate code path).
 //
 // Local host tests cover transfer accounting and generated account metadata.
-// Existing localnet integration tests require a matching deployed build and
-// were not rerun as part of the no-deployment fixes. See README.md for scope.
+// Localnet integration tests (tests/*.spec.ts) need an SBF build; see README.md.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
@@ -134,6 +133,8 @@ pub mod avelock_wallet {
         require!(pending.exists, AvelockError::NoPendingChange);
         let now = Clock::get()?.unix_timestamp;
         require!(now >= pending.effective_at, AvelockError::ChangeNotReady);
+        // A forgotten change does not stay armed forever (round2 L-3).
+        require!(now <= pending.effective_at.saturating_add(APPLY_WINDOW), AvelockError::ChangeExpired);
 
         write_param(extension, param, pending.new_value);
         extension.pending[idx] = PendingParamChange::default();
@@ -163,6 +164,8 @@ pub mod avelock_wallet {
     pub fn add_allowed_address(ctx: Context<AddAllowedAddress>) -> Result<()> {
         let extension = &ctx.accounts.extension;
         require!(!extension.locked, AvelockError::VaultLocked);
+        // As the EVM's ZeroAddress (MEGA_AUDIT sol_01 F2).
+        require!(ctx.accounts.destination.key() != Pubkey::default(), AvelockError::ZeroAddress);
         let entry = &mut ctx.accounts.entry;
         if entry.active_at != 0 {
             if !extension.voided_by_lock(entry.lock_epoch_at_add, entry.active_at) {
@@ -181,6 +184,17 @@ pub mod avelock_wallet {
         Ok(())
     }
 
+    /// Records that an active destination can no longer be voided by a later
+    /// lock (round2 L-4): every later lock comes after `active_at`. Anyone may
+    /// call it, also while locked; removal and re-adding reset it.
+    pub fn seal_allowed_address(ctx: Context<SealAllowedAddress>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let entry = &mut ctx.accounts.entry;
+        require!(entry.is_active(&ctx.accounts.extension, now), AvelockError::DestinationNotAllowed);
+        entry.lock_epoch_at_add = SEALED;
+        Ok(())
+    }
+
     pub fn remove_allowed_address(ctx: Context<RemoveAllowedAddress>) -> Result<()> {
         let entry = &mut ctx.accounts.entry;
         entry.epoch = entry.epoch.checked_add(1).unwrap();
@@ -192,7 +206,7 @@ pub mod avelock_wallet {
     // ---------------------------------------------------------------
     // Withdrawal lifecycle: request -> wait -> confirm. Split by asset
     // kind at the instruction level (native SOL vs. an SPL mint, which
-    // covers both fungible tokens and NFTs) since the required accounts
+    // classic SPL only, see confirm_token_withdrawal) since the required accounts
     // differ, rather than branching at runtime the way the EVM/TON
     // versions do inside one function.
     // ---------------------------------------------------------------
@@ -268,8 +282,12 @@ pub mod avelock_wallet {
 
     /// Cancel a pending request at any time before execution.
     pub fn cancel_withdrawal(ctx: Context<CancelWithdrawal>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
         let request = &mut ctx.accounts.request;
         require!(!request.executed && !request.cancelled, AvelockError::RequestAlreadyFinal);
+        // An expired request stays "expired", and its record waits out the
+        // retention period (MEGA_AUDIT sol_03 S1).
+        require!(now <= request.expires_at, AvelockError::RequestExpired);
         request.cancelled = true;
         emit!(WithdrawalCancelled { extension: request.extension, id: request.id });
         Ok(())
@@ -291,12 +309,15 @@ pub mod avelock_wallet {
             require!(now >= request.available_at, AvelockError::RequestNotReady);
             require!(now <= request.expires_at, AvelockError::RequestExpired);
             require!(request.mint.is_none(), AvelockError::NotNativeRequest);
+            // SOL sent to an account of this program or a token account is stranded (round2 L-7).
+            let to_owner = *ctx.accounts.to.owner;
+            require!(to_owner != crate::ID && to_owner != token::ID, AvelockError::InvalidDestination);
             require!(
                 ctx.accounts.allowlist.is_active(extension, now)
                     && ctx.accounts.allowlist.epoch == request.epoch_at_request,
                 AvelockError::DestinationNotAllowed
             );
-            require_keys_eq!(request.to, ctx.accounts.to.key(), AvelockError::AssetMismatch);
+            require_keys_eq!(request.to, ctx.accounts.to.key(), AvelockError::DestinationMismatch); // MEGA_AUDIT sol_04 E1
         }
 
         // The Vault owns data as well as SOL. Preserve its rent deposit so
@@ -314,9 +335,9 @@ pub mod avelock_wallet {
         Ok(())
     }
 
-    /// SPL-token path (covers both fungible tokens and NFTs — an NFT is
-    /// just a mint with supply 1 / 0 decimals on Solana, so no separate
-    /// instruction is needed the way EVM needs requestNFTWithdrawal).
+    /// Classic SPL-token path: fungible tokens and legacy NFTs (a mint with
+    /// supply 1 / 0 decimals).
+    /// Only classic SPL tokens in the vault's associated token account and legacy NFTs can leave: Token-2022 tokens, programmable NFTs (frozen token account), compressed NFTs, Metaplex Core assets and tokens in a non-associated account sent to the vault are stuck for good (round2 M-2).
     /// The destination token account is the recipient's own associated
     /// token account for this mint, derived and constraint-checked by
     /// Anchor — there is no arbitrary "which contract receives it"
@@ -337,8 +358,13 @@ pub mod avelock_wallet {
                     && ctx.accounts.allowlist.epoch == request.epoch_at_request,
                 AvelockError::DestinationNotAllowed
             );
-            require_keys_eq!(request.to, ctx.accounts.to.key(), AvelockError::AssetMismatch);
+            require_keys_eq!(request.to, ctx.accounts.to.key(), AvelockError::DestinationMismatch); // MEGA_AUDIT sol_04 E1
             require!(request.mint == Some(ctx.accounts.mint.key()), AvelockError::AssetMismatch);
+            // The vault is never its own destination, as on the native path (MEGA_AUDIT sol_01 F5).
+            require_keys_neq!(ctx.accounts.to.key(), ctx.accounts.vault.key(), AvelockError::InvalidDestination);
+            // Tokens go to a wallet's own token account; one owned by a program
+            // (a token account copied as a "deposit address") has no key (round2 L-2).
+            require_keys_eq!(*ctx.accounts.to.owner, anchor_lang::system_program::ID, AvelockError::InvalidDestination);
         }
 
         let owner_key = ctx.accounts.vault.owner;
@@ -380,8 +406,10 @@ pub mod avelock_wallet {
     }
 
     // ---------------------------------------------------------------
-    // Guard keys (plan B1): up to two stop-only keys. Adding and removing
-    // both wait address_delay; a guard cannot stop its own removal.
+    // Guard keys (plan B1): up to two stop-only keys. Adding waits
+    // address_delay; removing an active one waits change_wait + lock_delay,
+    // also through a lock (MEGA_AUDIT sol_01 F1). A guard cannot stop its own
+    // removal.
     // ---------------------------------------------------------------
 
     pub fn add_guard(ctx: Context<OwnerOnly>, key: Pubkey) -> Result<()> {
@@ -475,6 +503,7 @@ pub mod avelock_wallet {
         require!(ctx.accounts.extension.is_guard(&ctx.accounts.guard.key(), now), AvelockError::NotGuard);
         let request = &mut ctx.accounts.request;
         require!(!request.executed && !request.cancelled, AvelockError::RequestAlreadyFinal);
+        require!(now <= request.expires_at, AvelockError::RequestExpired); // MEGA_AUDIT sol_03 S1
         request.cancelled = true;
         emit!(WithdrawalCancelled { extension: request.extension, id: request.id });
         Ok(())
@@ -508,12 +537,16 @@ fn validate_param(param: u8, value: i64) -> Result<()> {
 fn propose_change(extension: &mut Account<SecurityExtension>, param: u8, new_value: i64, current_value: i64) -> Result<()> {
     validate_param(param, new_value)?;
     if new_value == current_value {
-        // Withdraws a queued change for this parameter (audit M-1).
-        extension.pending[param as usize] = PendingParamChange::default();
+        // Withdraws a queued change for this parameter (audit M-1), with an
+        // event as on EVM (MEGA_AUDIT sol_01 F4).
+        if extension.pending[param as usize].exists {
+            extension.pending[param as usize] = PendingParamChange::default();
+            emit!(ParamChangeCancelled { extension: extension.key(), param });
+        }
         return Ok(());
     }
     let now = Clock::get()?.unix_timestamp;
-    let effective_at = now + change_wait(extension.policy_delay, extension.withdrawal_delay);
+    let effective_at = now + change_wait_for(param, new_value, current_value, extension.policy_delay, extension.withdrawal_delay);
     extension.pending[param as usize] = PendingParamChange { new_value, effective_at, exists: true };
     emit!(ParamChangeQueued { extension: extension.key(), param, new_value, effective_at });
     Ok(())
@@ -524,6 +557,14 @@ fn propose_change(extension: &mut Account<SecurityExtension>, param: u8, new_val
 /// phrase thief withdraws sooner than the owner's delay.
 pub(crate) fn change_wait(policy_delay: i64, withdrawal_delay: i64) -> i64 {
     policy_delay.max(withdrawal_delay)
+}
+
+/// Lowering the address delay costs at least the current address delay
+/// (round2 M-1): else a short policy delay lets a phrase thief pay a new
+/// address sooner than the owner's address delay.
+pub(crate) fn change_wait_for(param: u8, new_value: i64, current_value: i64, policy_delay: i64, withdrawal_delay: i64) -> i64 {
+    let wait = change_wait(policy_delay, withdrawal_delay);
+    if param == PARAM_ADDRESS_DELAY && new_value < current_value { wait.max(current_value) } else { wait }
 }
 
 /// The lock delay a change may leave: never below the withdrawal delay.
@@ -620,6 +661,23 @@ pub struct AddAllowedAddress<'info> {
     pub entry: Account<'info, AllowlistEntry>,
 
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SealAllowedAddress<'info> {
+    #[account(
+        seeds = [SecurityExtension::SEED_PREFIX, extension.wallet.as_ref()],
+        bump = extension.bump,
+    )]
+    pub extension: Account<'info, SecurityExtension>,
+
+    #[account(
+        mut,
+        has_one = extension,
+        seeds = [AllowlistEntry::SEED_PREFIX, extension.key().as_ref(), entry.destination.as_ref()],
+        bump = entry.bump,
+    )]
+    pub entry: Account<'info, AllowlistEntry>,
 }
 
 #[derive(Accounts)]
@@ -1005,7 +1063,17 @@ mod lock_delay_tests {
 
 #[cfg(test)]
 mod change_wait_tests {
-    use super::change_wait;
+    use super::{change_wait, change_wait_for};
+    use crate::state::{PARAM_ADDRESS_DELAY, PARAM_WITHDRAWAL_DELAY};
+
+    /// Round2 M-1: lowering the address delay waits at least the old one.
+    #[test]
+    fn lowering_the_address_delay_waits_the_old_delay() {
+        let day = 86_400;
+        assert_eq!(change_wait_for(PARAM_ADDRESS_DELAY, day, 30 * day, 7 * day, day), 30 * day);
+        assert_eq!(change_wait_for(PARAM_ADDRESS_DELAY, 40 * day, 30 * day, 7 * day, day), 7 * day);
+        assert_eq!(change_wait_for(PARAM_WITHDRAWAL_DELAY, day, 30 * day, 7 * day, 2 * day), 7 * day);
+    }
 
     /// Audit A14-2: a short policy delay cannot lower the withdrawal delay
     /// sooner than a withdrawal under it could complete.

@@ -23,7 +23,11 @@ import type { Taptree } from 'bitcoinjs-lib/src/types';
 
 bitcoin.initEccLib(ecc);
 
-/** BIP-341 NUMS point: x-only key with no known discrete log. */
+/**
+ * BIP-341 NUMS point H: lift_x(SHA256(G)), G in uncompressed SEC form
+ * (04 ‖ x ‖ y). Anyone can recompute it (tests/nums.spec.ts does), so nobody
+ * chose it and its discrete log is unknown (MEGA_AUDIT btc_01 F3).
+ */
 export const NUMS_INTERNAL_KEY = Buffer.from(
   '50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0',
   'hex',
@@ -122,9 +126,19 @@ function toTree(leaves: Leaf[]): Taptree {
   return level[0];
 }
 
+/** More signers make the tree grow as n-choose-k: a bound keeps a vault buildable (MEGA_AUDIT btc_01 F1). */
+export const MAX_SIGNERS = 8;
+
+/**
+ * The script tree of one vault generation. It builds any valid threshold; the
+ * rule that several signers need a threshold of at least two lives in the
+ * signer service (validateTerms), which every vault passes through
+ * (MEGA_AUDIT btc_01 F8).
+ */
 export function createVault(params: VaultParams): Vault {
   assertXOnly(params.owner, 'owner');
   if (params.signers.length < 1) throw new Error('at least one signer is required');
+  if (params.signers.length > MAX_SIGNERS) throw new Error(`at most ${MAX_SIGNERS} signers`);
   // Canonical order: the same key set always yields the same address.
   params = { ...params, signers: [...params.signers].sort(Buffer.compare) };
   params.signers.forEach((s, i) => assertXOnly(s, `signers[${i}]`));

@@ -58,6 +58,8 @@ contract AvelockWallet is IERC721Receiver, IERC1155Receiver {
         if (msg.sender != deployer) revert VaultOnly();
         if (owner != address(0)) revert AlreadyInitialized();
         if (_owner == address(0) || _securityExtension == address(0)) revert ZeroAddress();
+        // The owner as the module would skip every delay (MEGA_AUDIT evm_02 L-1).
+        if (_owner == _securityExtension) revert ZeroAddress();
         owner = _owner;
         securityExtension = _securityExtension;
         extensions[_securityExtension] = true;

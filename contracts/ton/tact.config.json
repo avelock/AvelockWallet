@@ -7,7 +7,7 @@
       "output": "build/AvelockWallet",
       "options": {
         "debug": false,
-        "external": false
+        "external": true
       },
       "mode": "full"
     },
@@ -17,7 +17,7 @@
       "output": "build/AvelockSecurityExtension",
       "options": {
         "debug": false,
-        "external": false
+        "external": true
       },
       "mode": "full"
     },
@@ -27,7 +27,7 @@
       "output": "build/MockJettonWallet",
       "options": {
         "debug": false,
-        "external": false
+        "external": true
       },
       "mode": "full"
     },
@@ -37,7 +37,7 @@
       "output": "build/MockNftItem",
       "options": {
         "debug": false,
-        "external": false
+        "external": true
       },
       "mode": "full"
     }

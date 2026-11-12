@@ -54,4 +54,11 @@ pub enum AvelockError {
     NotPending,
     #[msg("A lock after this request voided it.")]
     RequestAnnulled,
+    // Appended only: codes follow declaration order (MEGA_AUDIT sol_04 E7).
+    #[msg("The recipient differs from the request.")]
+    DestinationMismatch,
+    #[msg("This change is already queued.")]
+    AlreadyQueued,
+    #[msg("This change waited too long and expired; queue it again.")]
+    ChangeExpired,
 }

@@ -20,6 +20,12 @@ export interface Signer {
   signSchnorr(hash: Buffer): Buffer;
 }
 
+/** A key that signs elsewhere (a native key module): the same, but asynchronous. */
+export interface AsyncSigner {
+  publicKey: Buffer;
+  signSchnorr(hash: Buffer): Promise<Buffer>;
+}
+
 /**
  * An unsigned spend through one door. Timelocked doors set the input
  * sequence to the door's CSV value, so the transaction is only valid once
@@ -83,6 +89,20 @@ export function signSpend(psbt: bitcoin.Psbt, key: Signer): void {
       signed++;
     }
   });
+  if (signed === 0) throw new Error('this key cannot sign any input');
+}
+
+/** signSpend with a key that signs elsewhere. */
+export async function signSpendAsync(psbt: bitcoin.Psbt, key: AsyncSigner): Promise<void> {
+  const adapter = { ...key, sign: async (): Promise<Buffer> => { throw new Error('ECDSA signing is not supported'); } };
+  let signed = 0;
+  for (let i = 0; i < psbt.data.inputs.length; i++) {
+    const leaf = psbt.data.inputs[i].tapLeafScript?.[0];
+    if (leaf && leaf.script.includes(key.publicKey)) {
+      await psbt.signTaprootInputAsync(i, adapter);
+      signed++;
+    }
+  }
   if (signed === 0) throw new Error('this key cannot sign any input');
 }
 

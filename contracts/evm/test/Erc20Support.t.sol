@@ -56,6 +56,24 @@ contract FalseToken {
     function transfer(address, uint256) external pure returns (bool) { return false; }
 }
 
+/// Returns true without moving anything (MEGA_AUDIT evm_01 L02).
+contract LyingTrueToken {
+    mapping(address => uint256) public balanceOf;
+    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
+    function transfer(address, uint256) external pure returns (bool) { return true; }
+}
+
+/// Charges a fee to the sender on top of the amount (MEGA_AUDIT evm_01 M02).
+contract SenderFeeToken {
+    mapping(address => uint256) public balanceOf;
+    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount + 1;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
 contract Erc20SupportTest is Test {
     address owner = makeAddr("owner");
     address recipient = makeAddr("recipient");
@@ -205,4 +223,24 @@ contract Erc20SupportTest is Test {
         ext.applyParamChange(AvelockSecurityExtension.Param.WithdrawalDelay);
         assertEq(ext.withdrawalDelay(), 2 days);
     }
+
+    function testTrueWithoutTransferIsRefused() public {
+        LyingTrueToken token = new LyingTrueToken();
+        token.mint(address(wallet), 10);
+        uint256 id = _request(address(token), 10);
+        vm.warp(block.timestamp + 1 days + 1);
+        vm.prank(owner);
+        vm.expectRevert(AvelockSecurityExtension.Erc20TransferFailed.selector);
+        ext.confirmWithdrawal(id);
+    }
+
+    function testSenderFeeTokenStillWithdraws() public {
+        SenderFeeToken token = new SenderFeeToken();
+        token.mint(address(wallet), 100);
+        uint256 id = _request(address(token), 50);
+        vm.warp(block.timestamp + 1 days + 1);
+        _confirm(id);
+        assertEq(token.balanceOf(recipient), 50);
+    }
+
 }

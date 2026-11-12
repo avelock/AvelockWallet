@@ -177,3 +177,126 @@ test('on the main networks the reserve door is at least two locked renewal inter
   expect(() => validateTerms(terms(52_560), undefined, minBtc)).not.toThrow(); // the app's Bitcoin door, ~1 year
   expect(Math.ceil(MIN_RESERVE_SECONDS_MAINNET / 150)).toBeLessThanOrEqual(57_600); // the app's Litecoin door, ~100 days
 });
+
+describe('MEGA_AUDIT btc_01', () => {
+  const key = (i: number) => (i + 1).toString(16).padStart(2, '0').repeat(32);
+  it('caps the signer set (F1)', () => {
+    const terms = (n: number) => ({ reserveBlocks: 52_560, signers: Array.from({ length: n }, (_, i) => key(i)), threshold: 2 }) as any;
+    expect(() => validateTerms(terms(8))).not.toThrow();
+    expect(() => validateTerms(terms(9))).toThrow(/at most 8 signers/);
+  });
+  it('an unknown owner operation is refused, nonce untouched (F4)', () => {
+    const { signer, register } = setup();
+    const { account, op } = register();
+    const nonce = signer.getAccount(account)!.nonce;
+    expect(() => op({ op: 'noSuchThing' } as any)).toThrow(/unknown operation/);
+    expect(signer.getAccount(account)!.nonce).toBe(nonce);
+  });
+});
+
+describe('MEGA_AUDIT btcsigner_01', () => {
+  it('main-network accounts need floors of at least a day (F-1)', () => {
+    const net = bitcoin.networks.bitcoin;
+    const clock = 1_800_000_000;
+    const kp = ECPair.makeRandom({ network: net });
+    const signer = new SignerService({ key: taprootSigner({ privateKey: kp.privateKey!, publicKey: Buffer.from(kp.publicKey) }), network: net, networkName: 'bitcoin', now: () => clock, sendSos: () => {} });
+    const mnemonic = bip39.generateMnemonic(256);
+    const owner = ownerKey(mnemonic, net);
+    const account = owner.publicKey.toString('hex');
+    const register = (floor: number) => signer.submit(signOperation({
+      domain: signer.domain, account, nonce: 0, expiresAt: clock + 600,
+      operation: { op: 'register', accountXpub: ownerAccountXpub(mnemonic, net), policy: { ...policy, policyDelay: 2 * DAY },
+        vault: { generation: 0, owner: account, signers: [signer.publicKey], threshold: 1, reserveBlocks: 52_560 },
+        floors: { withdrawalDelay: floor, addressDelay: floor } },
+    }, owner));
+    expect(() => register(3600)).toThrow(/at least 24 hours/);
+    expect(() => register(DAY)).not.toThrow();
+  });
+
+  it('main networks refuse a policy wait longer than half the reserve period (round2 L-5)', () => {
+    const net = bitcoin.networks.bitcoin;
+    const clock = 1_800_000_000;
+    const kp = ECPair.makeRandom({ network: net });
+    const signer = new SignerService({ key: taprootSigner({ privateKey: kp.privateKey!, publicKey: Buffer.from(kp.publicKey) }), network: net, networkName: 'bitcoin', now: () => clock, sendSos: () => {} });
+    const register = (policyDelay: number) => {
+      const mnemonic = bip39.generateMnemonic(256);
+      const owner = ownerKey(mnemonic, net);
+      const account = owner.publicKey.toString('hex');
+      return signer.submit(signOperation({
+        domain: signer.domain, account, nonce: 0, expiresAt: clock + 600,
+        operation: { op: 'register', accountXpub: ownerAccountXpub(mnemonic, net), policy: { ...policy, policyDelay },
+          vault: { generation: 0, owner: account, signers: [signer.publicKey], threshold: 1, reserveBlocks: 8640 }, // 60 days
+          floors: { withdrawalDelay: DAY, addressDelay: DAY } },
+      }, owner));
+    };
+    expect(() => register(40 * DAY)).toThrow(/half the reserve period/);
+    expect(() => register(20 * DAY)).not.toThrow();
+  });
+});
+
+
+describe('round2 bitcoin_signer', () => {
+  it('a stop lands even while someone floods the account (H-1)', () => {
+    const { signer, register } = setup();
+    const { account, op, mnemonic } = register();
+    const owner = ownerKey(mnemonic, network);
+    const seen = signer.getAccount(account)!;
+    const lock = signOperation({ domain: signer.domain, account, nonce: seen.nonce, expiresAt: 1_800_000_000 + 600, head: seen.head.hash, operation: { op: 'lock' } }, owner);
+    for (let i = 0; i < 20; i++) op({ op: 'removeAddress', address: destination });
+    expect(() => signer.submit(lock)).not.toThrow();
+    expect(signer.getAccount(account)!.locked).toBe(true);
+    expect(() => signer.submit(lock)).toThrow(/already applied/);
+  });
+
+  it('ordinary operations have an hourly budget per account (H-1)', () => {
+    const { register } = setup();
+    const { op } = register();
+    for (let i = 0; i < 60; i++) op({ op: 'addAddress', address: destination });
+    expect(() => op({ op: 'addAddress', address: destination })).toThrow(/too many operations/);
+  });
+});
+
+describe('round2 bitcoin_signer mediums', () => {
+  it('the state log does not tell whether the emergency PIN was used (M-1)', () => {
+    const { signer, register } = setup();
+    const { account, op } = register();
+    const before = signer.getAccount(account)!;
+    const body = { domain: signer.domain, account, nonce: before.nonce, expiresAt: 1_800_000_000 + 600, head: before.head.hash, operation: { op: 'addAddress', address: destination } };
+    op({ op: 'addAddress', address: destination }, true);
+    const { chainedDigest } = require('../src/signer/messages');
+    // What is logged for the duress operation is what a plain one would log.
+    expect(signer.getAccount(account)!.log!.at(-1)!.event).toEqual({ op: chainedDigest(body) });
+    const lockBody = { domain: signer.domain, account, nonce: 0, expiresAt: 1, operation: { op: 'lock' } };
+    expect(chainedDigest({ ...lockBody, duress: true })).toBe(chainedDigest(lockBody));
+  });
+
+  it('only the next generation number is accepted (M-2)', () => {
+    const { register } = setup();
+    const { op, mnemonic } = register();
+    const far = 0x7fffffff;
+    expect(() => op({ op: 'addGeneration', vault: { generation: far, owner: ownerKey(mnemonic, network, far).publicKey.toString('hex'), signers: [], threshold: 1, reserveBlocks: 52_560 } as any }))
+      .toThrow(/next generation|this signer/);
+  });
+
+  it('unknown policy fields are refused, not stored (M-4)', () => {
+    const { register } = setup();
+    const { op } = register();
+    expect(() => op({ op: 'changePolicy', policy: { ...policy, junk: 'x'.repeat(1000) } as any })).toThrow(/unknown policy field/);
+  });
+});
+
+test('allowlist entries stored in another spelling are found after a restart (REVIEW_last3days #11)', () => {
+  const { signer, register } = setup();
+  const { account } = register();
+  const lower = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(ECPair.makeRandom({ network }).publicKey), network }).address!;
+  const upper = lower.toUpperCase();
+  const state = JSON.parse(JSON.stringify((signer as any).state));
+  state.accounts[account].allowlist[upper] = { activeAt: 1, epoch: 0, lockEpoch: 0 };
+  state.accounts[account].addressEpochs[upper] = 2;
+  const kp = ECPair.makeRandom({ network });
+  const again = new SignerService({ key: taprootSigner({ privateKey: kp.privateKey!, publicKey: Buffer.from(kp.publicKey) }), network, networkName: 'regtest', state, sendSos: () => {} });
+  const a = again.getAccount(account)!;
+  expect(a.allowlist[lower]).toBeDefined();
+  expect(a.allowlist[upper]).toBeUndefined();
+  expect(a.addressEpochs[lower]).toBe(2);
+});

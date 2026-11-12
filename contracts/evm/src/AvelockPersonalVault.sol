@@ -5,7 +5,8 @@ import {AvelockWallet} from "./AvelockWallet.sol";
 import {AvelockSecurityExtension} from "./extensions/AvelockSecurityExtension.sol";
 
 /// @notice An owner-created, recoverable deployment receipt. Creates a protected
-/// wallet atomically; its address is recoverable from the owner's CREATE nonce.
+/// wallet atomically; on EVM chains its address follows from the owner's CREATE
+/// nonce (TRON derives it from the transaction id instead; round2 R2-L06).
 /// @dev The caller picks the initial policy at creation time — e.g. a Deep
 ///      Vault meant to hold funds for years can start with a stricter
 ///      config (longer address delay, higher minimums) instead of always

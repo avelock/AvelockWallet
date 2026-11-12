@@ -16,6 +16,10 @@ const OP_FINALIZE_GUARD_REMOVAL = 21;
 const OP_LOCK = 22;
 const OP_UNLOCK = 23;
 const OP_SET_LOCK_DELAY = 24;
+const OP_SET_ADDRESS_DELAY = 7;
+const OP_APPLY_PARAM_CHANGE = 9;
+const OP_REGISTER_ASSET = 16;
+const PARAM_ADDRESS_DELAY = 1;
 const PARAM_POLICY_DELAY = 2;
 
 const DAY = 24 * 60 * 60;
@@ -37,10 +41,11 @@ describe('Guard keys and Panic Lock (TON)', () => {
     const now = () => blockchain.now ?? Math.floor(Date.now() / 1000);
     const wait = (s: number) => { blockchain.now = now() + s; };
 
-    async function op(code: number, payload: (b: ReturnType<typeof beginCell>) => void = () => {}) {
+    async function op(code: number, payload: (b: ReturnType<typeof beginCell>) => void = () => {}, tail: (b: ReturnType<typeof beginCell>) => void = () => {}) {
         const b = beginCell().storeAddress(ext.address).storeInt(GLOBAL_ID, 32).storeUint(seqno, 32).storeUint(now() + 600, 32).storeUint(code, 8);
         payload(b);
         if (code === OP_REQUEST_WITHDRAWAL) b.storeMaybeRef(null).storeBit(true);
+        tail(b);
         const unsigned: Cell = b.endCell();
         seqno++;
         const body = beginCell().storeBuffer(sign(unsigned.hash(), secretKey)).storeRef(unsigned).endCell();
@@ -161,6 +166,7 @@ describe('Guard keys and Panic Lock (TON)', () => {
         wait(7 * DAY);
         expect(await ext.getIsAddressActive(stranger.address)).toBe(false);
         expect(await ext.getIsAddressActive(recipient.address)).toBe(true);
+        expect(await ext.getAddressActiveAt(stranger.address)).toBe(0n); // round2 M-2
         await op(OP_UNLOCK);
         await op(OP_ADD_ALLOWED_ADDRESS, b => b.storeAddress(stranger.address));
         expect(await ext.getIsAddressActive(stranger.address)).toBe(false);
@@ -178,29 +184,38 @@ describe('Guard keys and Panic Lock (TON)', () => {
         expect(await ext.getIsGuard(guard.address)).toBe(true);
     });
 
-    it('removing an active guard waits and the guard cannot stop it', async () => {
+    const removalWait = async () => {
+        const w = await ext.getWithdrawalDelay();
+        const p = await ext.getPolicyDelay();
+        return Number(p > w ? p : w) + Number(await ext.getLockDelay());
+    };
+
+    it('removing an active guard waits changeWait + lockDelay and the guard cannot stop it (MEGA_AUDIT ton_02 F1)', async () => {
         await op(OP_REMOVE_GUARD, b => b.storeAddress(guard.address));
         expect(await ext.getIsGuard(guard.address)).toBe(true);
+        const total = await removalWait();
+        wait(total - 10);
         const early = await op(OP_FINALIZE_GUARD_REMOVAL, b => b.storeAddress(guard.address));
         expect(await early.failed()).toBe(true);
-        wait(ADDRESS_DELAY + 1);
+        wait(20);
         await op(OP_FINALIZE_GUARD_REMOVAL, b => b.storeAddress(guard.address));
         expect(await ext.getIsGuard(guard.address)).toBe(false);
     });
 
-    it('a lock drops a queued guard removal and it cannot finish while locked (A15-1)', async () => {
-        await op(OP_REMOVE_GUARD, b => b.storeAddress(guard.address));
+    it('a rogue guard re-locking cannot keep itself in place (MEGA_AUDIT ton_02 F1)', async () => {
         await ext.send(guard.getSender(), { value: toNano('0.05') }, { $$type: 'GuardLock' });
-        wait(ADDRESS_DELAY + 1);
-        const during = await op(OP_FINALIZE_GUARD_REMOVAL, b => b.storeAddress(guard.address));
-        expect(await during.failed()).toBe(true);
-        const requeue = await op(OP_REMOVE_GUARD, b => b.storeAddress(guard.address));
-        expect(await requeue.failed()).toBe(true);
-        wait(7 * DAY);
-        await op(OP_UNLOCK);
-        const after = await op(OP_FINALIZE_GUARD_REMOVAL, b => b.storeAddress(guard.address));
-        expect(await after.failed()).toBe(true);
-        expect(await ext.getIsGuard(guard.address)).toBe(true);
+        await op(OP_REMOVE_GUARD, b => b.storeAddress(guard.address)); // allowed while locked
+        const again = await op(OP_REMOVE_GUARD, b => b.storeAddress(guard.address));
+        expect(await again.failed()).toBe(true); // already queued
+        const total = await removalWait();
+        for (let k = 0; k < 3; k++) {
+            wait(Math.floor(total / 3));
+            await ext.send(guard.getSender(), { value: toNano('0.05') }, { $$type: 'GuardLock' });
+        }
+        wait(10);
+        await op(OP_FINALIZE_GUARD_REMOVAL, b => b.storeAddress(guard.address)); // while locked
+        expect(await ext.getLocked()).toBe(true);
+        expect(await ext.getIsGuard(guard.address)).toBe(false);
     });
 
     it('a guard drops a guard that is still waiting', async () => {
@@ -215,4 +230,45 @@ describe('Guard keys and Panic Lock (TON)', () => {
         expect(await low.failed()).toBe(true);
         expect(await ext.getLastFailureCode()).toBe(56n);
     });
+
+    it('a guard cancels an asset registration that is still waiting (round2 L-3)', async () => {
+        const item = stranger.address;
+        await op(OP_REGISTER_ASSET, b => b.storeAddress(item).storeUint(2, 2).storeRef(beginCell().storeAddress(recipient.address).endCell()));
+        expect(await ext.getAssetRegistration(item)).not.toBeNull();
+        await ext.send(guard.getSender(), { value: toNano('0.05') }, { $$type: 'GuardCancelPendingAsset', asset: item });
+        expect(await ext.getAssetRegistration(item)).toBeNull();
+        const r = await ext.send(stranger.getSender(), { value: toNano('0.05') }, { $$type: 'GuardCancelPendingAsset', asset: item });
+        expect(r.transactions).toHaveTransaction({ to: ext.address, success: false, exitCode: 76 });
+    });
+
+    it('keeps the result of each recent operation by seqno (round2 L-4)', async () => {
+        const first = seqno;
+        await op(OP_LOCK);
+        await op(OP_UNLOCK); // too early: fails
+        expect(await ext.getOperationResult(BigInt(first))).toBe(0n);
+        expect(await ext.getOperationResult(BigInt(first + 1))).toBe(73n);
+        for (let i = 0; i < 8; i++) await op(OP_LOCK);
+        expect(await ext.getOperationResult(BigInt(first))).toBeNull();
+    });
+
+    it('a request may carry a larger asset hop budget, capped at 0.3 TON (round2 L-2)', async () => {
+        const id = (await ext.getNextRequestId?.()) ?? 0n;
+        await op(OP_REQUEST_WITHDRAWAL, b => b.storeAddress(recipient.address).storeCoins(toNano('1')).storeUint(0, 2), b => b.storeCoins(toNano('0.2')));
+        expect((await ext.getRequest(id))?.hopValue).toBe(toNano('0.2'));
+        const tooMuch = await op(OP_REQUEST_WITHDRAWAL, b => b.storeAddress(recipient.address).storeCoins(toNano('1')).storeUint(0, 2), b => b.storeCoins(toNano('0.4')));
+        expect(await tooMuch.failed()).toBe(true);
+        const plain = await request(recipient.address);
+        expect(await plain.failed()).toBe(false);
+    });
+
+    it('lowering the address delay waits at least the current address delay (round2 M-1)', async () => {
+        await op(OP_SET_ADDRESS_DELAY, b => b.storeUint(10 * DAY, 32));
+        wait(POLICY_DELAY + 1);
+        await op(OP_APPLY_PARAM_CHANGE, b => b.storeUint(PARAM_ADDRESS_DELAY, 8));
+        expect(await ext.getAddressDelay()).toBe(BigInt(10 * DAY));
+        await op(OP_SET_ADDRESS_DELAY, b => b.storeUint(DAY, 32));
+        const pending = await ext.getPendingParamChange(BigInt(PARAM_ADDRESS_DELAY));
+        expect(Number(pending!.effectiveAt)).toBeGreaterThanOrEqual(now() + 10 * DAY);
+    });
+
 });

@@ -116,10 +116,13 @@ contract GuardAndLockTest is Test {
         vm.prank(guard);
         vm.expectRevert(AvelockSecurityExtension.NotOwner.selector);
         ext.removeGuard(guard);
+        // It waits changeWait() + lockDelay, not just the address delay (MEGA_AUDIT evm_04 L01).
+        uint256 wait = ext.changeWait() + ext.lockDelay();
+        vm.warp(block.timestamp + wait - 1);
         vm.prank(owner);
         vm.expectRevert(AvelockSecurityExtension.ChangeNotReady.selector);
         ext.finalizeGuardRemoval(guard);
-        vm.warp(block.timestamp + 2 days);
+        vm.warp(block.timestamp + 1);
         vm.prank(owner);
         ext.finalizeGuardRemoval(guard);
         assertFalse(ext.isGuard(guard));
@@ -226,36 +229,42 @@ contract GuardAndLockTest is Test {
         assertEq(ext.lockEpoch(), 1); // one lock, extended
     }
 
-    function testWhileLockedCancelsStillWorkButGuardRemovalDoesNot() public {
+    function testWhileLockedCancelsAndGuardRemovalQueueStillWork() public {
         uint256 id = _request(1 ether);
         vm.startPrank(owner);
         ext.lock();
         ext.cancelWithdrawal(id);
         ext.removeAllowedAddress(exchange);
-        vm.expectRevert(AvelockSecurityExtension.VaultLocked.selector);
+        // Queuing a guard removal works while locked too (MEGA_AUDIT evm_04 H01); the guard stays until it finishes.
         ext.removeGuard(guard);
         vm.stopPrank();
         assertTrue(ext.isGuard(guard));
     }
 
-    /// A15-1: a phrase thief queues the guard's removal; the guard locks; the
-    /// removal must not complete during the lock, and the lock drops it.
-    function testLockDropsAQueuedGuardRemovalAndItCannotFinishWhileLocked() public {
-        vm.prank(owner);
-        ext.removeGuard(guard);
+    /// Since d5ea5e3 (the A15-1 rule was reversed): a queued removal is kept
+    /// by locks and finishes during one. A rogue guard re-locking cannot keep itself in place (MEGA_AUDIT evm_04 H01):
+    /// the owner's queued removal survives every lock and finishes while locked.
+    function testARogueGuardCannotFreezeTheVaultForGood() public {
         vm.prank(guard);
         ext.lock();
-        vm.warp(block.timestamp + 2 days + 1);
         vm.prank(owner);
-        vm.expectRevert(AvelockSecurityExtension.VaultLocked.selector);
-        ext.finalizeGuardRemoval(guard);
-        vm.warp(block.timestamp + 7 days);
-        vm.startPrank(owner);
+        ext.removeGuard(guard); // allowed during a lock
+        uint256 wait = ext.changeWait() + ext.lockDelay();
+        for (uint256 k; k < 3; k++) {
+            vm.warp(block.timestamp + wait / 3);
+            vm.prank(guard);
+            ext.lock(); // keeps re-locking; the removal stays queued
+        }
+        vm.warp(block.timestamp + wait);
+        vm.prank(owner);
+        ext.finalizeGuardRemoval(guard); // while still locked
+        assertFalse(ext.isGuard(guard));
+        vm.warp(block.timestamp + ext.lockDelay() + 1);
+        vm.prank(owner);
         ext.unlock();
-        vm.expectRevert(AvelockSecurityExtension.NotPending.selector);
-        ext.finalizeGuardRemoval(guard);
-        vm.stopPrank();
-        assertTrue(ext.isGuard(guard));
+        vm.prank(guard);
+        vm.expectRevert();
+        ext.lock(); // no longer a guard
     }
 
     function testLockDelayCannotGoBelowTheWithdrawalFloor() public {
@@ -309,4 +318,15 @@ contract GuardAndLockTest is Test {
         (address to,,,,,,) = ext.requests(id);
         assertEq(to, address(0));
     }
+
+    function testTheVaultOrModuleCannotBeAGuard() public {
+        vm.startPrank(owner);
+        ext.removeGuard(guard);
+        vm.expectRevert(AvelockSecurityExtension.InvalidParameter.selector);
+        ext.addGuard(address(ext));
+        vm.expectRevert(AvelockSecurityExtension.ChangeAlreadyPending.selector);
+        ext.removeGuard(guard);
+        vm.stopPrank();
+    }
+
 }

@@ -13,6 +13,7 @@ const OP_ADD_ALLOWED_ADDRESS = 1;
 const OP_REMOVE_ALLOWED_ADDRESS = 2;
 const OP_REQUEST_WITHDRAWAL = 3;
 const OP_CANCEL_WITHDRAWAL = 4;
+const OP_PRUNE_REQUEST = 12;
 const OP_CONFIRM_WITHDRAWAL = 5;
 const OP_SET_WITHDRAWAL_DELAY = 6;
 const OP_SET_ADDRESS_DELAY = 7;
@@ -593,6 +594,18 @@ describe('AvelockSecurityExtension (withdrawal execution)', () => {
         // forwarded to the security module along with the failure notice.
         expect((await blockchain.getContract(wallet.address)).balance).toBeGreaterThan(before - toNano('0.1'));
         expect((await blockchain.getContract(ext.address)).balance).toBeLessThan(extBefore);
+    });
+
+    it('a failed request can be cancelled and pruned at once (round2 M-1)', async () => {
+        const fresh = new Address(0, Buffer.alloc(32, 0xce));
+        await withdrawNativeTo(fresh, true);
+        expect((await ext.getRequest(0n))?.failed).toBe(true);
+        let sq = Number(await ext.getSeqno());
+        await ext.sendExternal(buildExternalBody(ownerSecretKey, sq++, OP_CANCEL_WITHDRAWAL, b => b.storeUint(0, 64)).asSlice());
+        expect(await ext.getLastFailureCode()).toBe(0n);
+        expect((await ext.getRequest(0n))?.cancelled).toBe(true);
+        await ext.sendExternal(buildExternalBody(ownerSecretKey, sq++, OP_PRUNE_REQUEST, b => b.storeUint(0, 64)).asSlice());
+        expect(await ext.getRequest(0n)).toBeNull();
     });
 
     it('rejects a non-bounceable flag for jetton/NFT withdrawals', async () => {

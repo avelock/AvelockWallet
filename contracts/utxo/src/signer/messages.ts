@@ -9,7 +9,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
-import type { Signer } from '../spend';
+import type { AsyncSigner, Signer } from '../spend';
 
 export type Operation =
   | { op: 'register'; accountXpub: string; vault: VaultConfig; policy: Policy; floors: Floors }
@@ -134,6 +134,56 @@ export interface ReadBody {
   operation: { op: 'read'; since?: number };
 }
 
+/**
+ * Owner-signed co-signing request (MEGA_AUDIT btc_02 F1): the PSBT, request
+ * and head the owner means, bound to the signer and expiring soon. Knowing
+ * the head alone no longer lets anyone ask for a co-signature.
+ */
+export interface CosignBody {
+  domain: SignerDomain;
+  account: string;
+  expiresAt: number;
+  operation:
+    | { op: 'cosignWithdrawal'; requestId: number; head: string; psbt: string }
+    | { op: 'cosignRefresh'; head: string; psbt: string };
+}
+
+export interface SignedCosign {
+  body: CosignBody;
+  signature: string;
+}
+
+/** sha256 of the PSBT text, hex: what a co-signing request names. */
+export function psbtDigest(psbtBase64: string): string {
+  return bitcoin.crypto.sha256(Buffer.from(psbtBase64)).toString('hex');
+}
+
+export function signCosign(body: CosignBody, identity: Signer): SignedCosign {
+  return { body, signature: identity.signSchnorr(operationDigest(body)).toString('hex') };
+}
+
+const REPLY_TAG = 'Avelock/signer-reply';
+
+/**
+ * A signer's answer, signed by its key and bound to the request it answers
+ * (mobile_12 MB-1): a network attacker or a proxy in front of the signer can
+ * no longer change what the app is told, even without HTTPS.
+ */
+export function replyDigest(requestSignature: string, reply: unknown): Buffer {
+  const tag = bitcoin.crypto.sha256(Buffer.from(REPLY_TAG));
+  return bitcoin.crypto.sha256(Buffer.concat([tag, tag, Buffer.from(canonicalJson({ request: requestSignature, reply }))]));
+}
+
+export function verifyReply(signerKey: string, requestSignature: string, json: Record<string, unknown>): boolean {
+  const { signerSignature, ...reply } = json;
+  if (typeof signerSignature !== 'string') return false;
+  try {
+    return ecc.verifySchnorr(replyDigest(requestSignature, reply), Buffer.from(signerKey, 'hex'), Buffer.from(signerSignature, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
 /** One entry of an account's state hash chain. */
 export interface StateEvent {
   seq: number;
@@ -166,7 +216,7 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export function operationDigest(body: OperationBody | ReadBody): Buffer {
+export function operationDigest(body: OperationBody | ReadBody | CosignBody): Buffer {
   const tag = bitcoin.crypto.sha256(Buffer.from(TAG));
   return bitcoin.crypto.sha256(Buffer.concat([tag, tag, Buffer.from(canonicalJson(body))]));
 }
@@ -249,7 +299,7 @@ export function verifyGuardOperation(signed: SignedGuardOperation): boolean {
   }
 }
 
-export function verifyOperation(signed: SignedOperation | SignedRead): boolean {
+export function verifyOperation(signed: SignedOperation | SignedRead | SignedCosign): boolean {
   try {
     return ecc.verifySchnorr(
       operationDigest(signed.body),
@@ -259,4 +309,34 @@ export function verifyOperation(signed: SignedOperation | SignedRead): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The digest chained into a signer's state log: the operation without its
+ * duress flag (round2 M-1). Every other field is known to whoever holds the
+ * phrase, so a digest over the flag let a coercer test, by hashing both ways,
+ * whether the emergency PIN was used.
+ */
+export function chainedDigest(body: OperationBody): string {
+  return operationDigest({ ...body, duress: undefined }).toString('hex');
+}
+
+// Asynchronous variants, for a key that signs elsewhere (a native key module).
+
+export async function signOperationAsync(body: OperationBody, identity: AsyncSigner): Promise<SignedOperation> {
+  const op = body.operation;
+  let full = body;
+  if (op.op === 'requestWithdrawal' && !op.intent) {
+    const intent = (await identity.signSchnorr(intentDigest({ domain: body.domain, account: body.account, nonce: body.nonce, to: op.to, amount: op.amount }))).toString('hex');
+    full = { ...body, operation: { ...op, intent } };
+  }
+  return { body: full, signature: (await identity.signSchnorr(operationDigest(full))).toString('hex') };
+}
+
+export async function signReadAsync(body: ReadBody, identity: AsyncSigner): Promise<SignedRead> {
+  return { body, signature: (await identity.signSchnorr(operationDigest(body))).toString('hex') };
+}
+
+export async function signCosignAsync(body: CosignBody, identity: AsyncSigner): Promise<SignedCosign> {
+  return { body, signature: (await identity.signSchnorr(operationDigest(body))).toString('hex') };
 }

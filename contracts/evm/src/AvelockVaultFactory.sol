@@ -30,6 +30,8 @@ contract AvelockVaultFactory {
     event VaultCreated(address indexed owner, address wallet, address extension);
 
     error VaultExists();
+    /// @notice CREATE2 failed (out of gas): not an existing vault (MEGA_AUDIT evm_03 MAVF-04).
+    error DeploymentFailed();
 
     constructor() {
         walletImplementation = address(new AvelockWallet());
@@ -86,7 +88,7 @@ contract AvelockVaultFactory {
         assembly {
             instance := create2(0, add(code, 0x20), mload(code), salt)
         }
-        if (instance == address(0)) revert VaultExists();
+        if (instance == address(0)) revert DeploymentFailed();
     }
 
     function predictVault(address owner) external view returns (address wallet, address extension) {

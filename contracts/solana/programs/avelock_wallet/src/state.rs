@@ -51,6 +51,11 @@ pub const DEFAULT_LOCK_DELAY: i64 = 7 * 24 * 60 * 60;
 /// lock came. Older than this and the destination counts as voided (it must
 /// be added again) — the safe side of not knowing.
 pub const LOCK_HISTORY: usize = 4;
+/// A queued change or guard removal must be applied within this long after it
+/// becomes ready, else it expires (round2 L-3).
+pub const APPLY_WINDOW: i64 = 30 * 86_400;
+/// `lock_epoch_at_add` of a sealed destination: no later lock voids it (round2 L-4).
+pub const SEALED: u64 = u64::MAX;
 
 /// Mirrors AvelockWallet: owner + the one module account trusted to move funds.
 #[account]
@@ -148,7 +153,8 @@ impl SecurityExtension {
     }
 
     pub fn add_guard(&mut self, key: Pubkey, owner: &Pubkey, now: i64) -> Result<()> {
-        require!(key != Pubkey::default() && key != *owner, AvelockError::InvalidParameter);
+        require!(key != Pubkey::default(), AvelockError::ZeroAddress);
+        require!(key != *owner, AvelockError::InvalidParameter);
         require!(self.guard_index(&key).is_none(), AvelockError::GuardExists);
         let free = self.guards.iter().position(|g| g.key == Pubkey::default()).ok_or(AvelockError::TooManyGuards)?;
         self.guards[free] = GuardSlot { key, active_at: now + self.address_delay, removable_at: 0 };
@@ -156,17 +162,18 @@ impl SecurityExtension {
     }
 
     /// A guard still waiting is dropped at once; an active one is queued for
-    /// removal and stays active for `address_delay`.
+    /// removal and stays active for change_wait + lock_delay. Allowed during
+    /// a lock and kept by later locks (MEGA_AUDIT sol_01 F1, as EVM H01): a
+    /// rogue guard re-locking cannot make itself irremovable.
     pub fn remove_guard(&mut self, key: &Pubkey, now: i64) -> Result<()> {
         let i = self.guard_index(key).ok_or(AvelockError::GuardNotFound)?;
-        let address_delay = self.address_delay;
+        let wait = crate::change_wait(self.policy_delay, self.withdrawal_delay) + self.lock_delay;
         let g = &mut self.guards[i];
         if now < g.active_at {
             *g = GuardSlot::default();
-        } else if g.removable_at == 0 {
-            // Queued only while unlocked; a lock drops it (audit A15-1).
-            require!(!self.locked, AvelockError::VaultLocked);
-            self.guards[i].removable_at = now + address_delay;
+        } else {
+            require!(g.removable_at == 0, AvelockError::AlreadyQueued);
+            g.removable_at = now + wait;
         }
         Ok(())
     }
@@ -191,17 +198,17 @@ impl SecurityExtension {
         let at = self.guards[i].removable_at;
         require!(at != 0, AvelockError::NotPending);
         require!(now >= at, AvelockError::ChangeNotReady);
-        // Never during a lock (audit A15-1): else a phrase thief waits out
-        // the guard's lock and no one is left to extend it.
-        require!(!self.locked, AvelockError::VaultLocked);
+        require!(now <= at.saturating_add(APPLY_WINDOW), AvelockError::ChangeExpired); // round2 L-3
+        // Also during a lock (MEGA_AUDIT sol_01 F1): the long wait above is
+        // what holds a phrase thief off, not the lock.
         self.guards[i] = GuardSlot::default();
         Ok(())
     }
 
     /// Panic Lock: instant. Voids pending requests and waiting destinations
-    /// (by epoch), cancels queued changes, waiting guards and queued guard
-    /// removals. Locking again
-    /// extends the wait.
+    /// (by epoch), cancels queued changes and waiting guards. A queued
+    /// removal of an active guard stays (MEGA_AUDIT sol_01 F1). Locking
+    /// again extends the wait.
     pub fn lock(&mut self, now: i64) {
         let until = now + self.lock_delay;
         if self.locked {
@@ -210,15 +217,12 @@ impl SecurityExtension {
         }
         self.locked = true;
         self.unlock_after = until;
-        self.lock_epoch += 1;
+        self.lock_epoch = self.lock_epoch.checked_add(1).unwrap();
         self.lock_times[((self.lock_epoch - 1) % LOCK_HISTORY as u64) as usize] = now;
         self.pending = [PendingParamChange::default(); PARAM_COUNT];
         for g in self.guards.iter_mut() {
             if g.key != Pubkey::default() && now < g.active_at {
                 *g = GuardSlot::default();
-            } else {
-                // A queued removal of an active guard is void too (A15-1).
-                g.removable_at = 0;
             }
         }
     }
@@ -297,8 +301,9 @@ impl AllowlistEntry {
 }
 
 /// Mirrors `WithdrawalRequest`/`requestEpoch`/`assetKind`/`tokenId`. On
-/// Solana a fungible token and an NFT are both just SPL mints (an NFT is
-/// simply a mint with supply 1 and 0 decimals), so — unlike the EVM side,
+/// Solana a fungible token and a legacy NFT are both classic SPL mints (an
+/// NFT is a mint with supply 1 and 0 decimals; Token-2022, programmable,
+/// compressed and Core assets are not supported, round2 M-2), so — unlike the EVM side,
 /// which needs a separate `requestNFTWithdrawal` and an
 /// ERC-20/721/1155 discriminant — one `mint: Option<Pubkey>` field
 /// covers native SOL (`None`) and any SPL asset (`Some`) uniformly.
@@ -408,23 +413,27 @@ mod guard_lock_tests {
         assert!(ext.add_guard(c, &owner, 100).is_err()); // a third
     }
 
-    /// A15-1: a queued removal of the guard cannot finish during a lock, the
-    /// lock drops it, and a new one cannot be queued while locked.
+    /// MEGA_AUDIT sol_01 F1: a queued removal of an active guard survives
+    /// its locks and finishes during a lock, so a rogue guard's freeze is
+    /// bounded (change_wait + lock_delay, plus one last lock_delay; round2 L-8).
     #[test]
-    fn a_lock_drops_a_queued_guard_removal_and_it_cannot_finish_while_locked() {
+    fn a_rogue_guard_relocking_cannot_keep_itself_in_place() {
+        // MEGA_AUDIT sol_01 F1: the owner's queued removal survives every lock.
         let owner = Pubkey::new_unique();
         let g = Pubkey::new_unique();
         let mut ext = extension();
         ext.add_guard(g, &owner, 0).unwrap();
         let t = 3 * DAY;
-        ext.remove_guard(&g, t).unwrap();
-        ext.lock(t + 1);
-        assert!(ext.finalize_guard_removal(&g, t + 3 * DAY).is_err());
-        assert!(ext.remove_guard(&g, t + 3 * DAY).is_err());
-        let later = t + 30 * DAY;
-        ext.unlock(later).unwrap();
-        assert!(ext.finalize_guard_removal(&g, later).is_err()); // dropped by the lock
-        assert!(ext.is_guard(&g, later));
+        ext.lock(t);
+        ext.remove_guard(&g, t + 1).unwrap(); // allowed while locked
+        assert!(ext.remove_guard(&g, t + 2).is_err()); // already queued
+        let wait = crate::change_wait(ext.policy_delay, ext.withdrawal_delay) + ext.lock_delay;
+        for k in 1..=3 {
+            ext.lock(t + k * wait / 3); // the guard keeps re-locking
+        }
+        assert!(ext.finalize_guard_removal(&g, t + wait).is_err());
+        ext.finalize_guard_removal(&g, t + 1 + wait).unwrap(); // while still locked
+        assert!(!ext.is_guard(&g, t + 1 + wait));
     }
 
     #[test]
@@ -435,9 +444,11 @@ mod guard_lock_tests {
         ext.add_guard(a, &owner, 0).unwrap();
         ext.remove_guard(&a, 3 * DAY).unwrap();
         assert!(ext.is_guard(&a, 3 * DAY)); // still active while queued
-        assert!(ext.finalize_guard_removal(&a, 4 * DAY).is_err());
-        ext.finalize_guard_removal(&a, 5 * DAY).unwrap();
-        assert!(!ext.is_guard(&a, 5 * DAY));
+        // change_wait + lock_delay, not the address delay (MEGA_AUDIT sol_01 F1).
+        let wait = crate::change_wait(ext.policy_delay, ext.withdrawal_delay) + ext.lock_delay;
+        assert!(ext.finalize_guard_removal(&a, 3 * DAY + wait - 1).is_err());
+        ext.finalize_guard_removal(&a, 3 * DAY + wait).unwrap();
+        assert!(!ext.is_guard(&a, 3 * DAY + wait));
 
         ext.add_guard(b, &owner, 10 * DAY).unwrap();
         ext.remove_guard(&b, 10 * DAY).unwrap();
@@ -522,4 +533,21 @@ mod guard_lock_tests {
         // One lock too many: we no longer know, so it must be added again.
         assert!(!old.is_active(&ext, 10_000_001));
     }
+
+    #[test]
+    fn a_sealed_destination_survives_any_number_of_locks() {
+        let mut ext = extension();
+        for t in 1..=10 { ext.lock(t * 100); ext.locked = false; }
+        assert!(!ext.voided_by_lock(SEALED, 50));
+    }
+
+    #[test]
+    fn a_ready_guard_removal_expires_after_the_apply_window() {
+        let mut ext = extension();
+        let g = Pubkey::new_unique();
+        ext.guards[0] = GuardSlot { key: g, active_at: 0, removable_at: 10 };
+        assert!(ext.finalize_guard_removal(&g, 10 + APPLY_WINDOW + 1).is_err());
+        assert!(ext.finalize_guard_removal(&g, 10 + APPLY_WINDOW).is_ok());
+    }
+
 }

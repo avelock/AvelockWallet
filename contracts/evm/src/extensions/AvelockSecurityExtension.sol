@@ -49,6 +49,9 @@ contract AvelockSecurityExtension is IExtension {
     ///      from years of use without erasing recent history.
     uint256 public constant REQUEST_RETENTION = 182 days;
     uint256 public constant MAX_GUARDS = 2;
+    /// @notice A matured setting change or guard removal must be applied within this time (round2 R2-L01).
+    uint256 public constant APPLY_WINDOW = 30 days;
+    uint256 internal constant ROUNDING_SLACK = 2;
     /// @dev Default wait before an owner can lift a Panic Lock (at least the withdrawal delay).
     uint256 public constant DEFAULT_LOCK_DELAY = 7 days;
 
@@ -100,7 +103,8 @@ contract AvelockSecurityExtension is IExtension {
     uint256 public confirmationWindow;
     uint256 public policyDelay;
 
-    /// @dev All parameter changes wait the current policy delay and obey fixed caps.
+    /// @dev All parameter changes wait changeWait() (policy delay, never below the
+    ///      withdrawal delay; lowering the address delay waits at least that delay) and obey fixed caps.
     mapping(Param => PendingParamChange) public pendingParamChanges;
 
     /// @dev 0 = never added; >0 = timestamp at which the address becomes
@@ -138,6 +142,7 @@ contract AvelockSecurityExtension is IExtension {
         uint256 availableAt,
         uint256 expiresAt
     );
+    event NftWithdrawalRequested(uint256 indexed requestId, uint8 kind, uint256 tokenId);
     event WithdrawalCancelled(uint256 indexed requestId);
     event WithdrawalExecuted(uint256 indexed requestId);
     event ParamChangeApplied(Param indexed param, uint256 newValue);
@@ -163,6 +168,7 @@ contract AvelockSecurityExtension is IExtension {
     error ZeroAddress();
     error NoPendingChange();
     error ChangeNotReady();
+    error ChangeExpired();
     error BelowImmutableMinimum();
     error Erc20TransferFailed();
     error AlreadyInitialized();
@@ -175,6 +181,7 @@ contract AvelockSecurityExtension is IExtension {
     error GuardExists();
     error RequestAnnulled();
     error NotPending();
+    error ChangeAlreadyPending();
 
     modifier onlyOwner() {
         if (msg.sender != IAvelockWallet(walletAddress).owner()) revert NotOwner();
@@ -215,6 +222,8 @@ contract AvelockSecurityExtension is IExtension {
         if (_addressDelay < _minAddressDelay) revert BelowImmutableMinimum();
 
         if (_minWithdrawalDelay == 0 || _minAddressDelay == 0) revert InvalidParameter();
+        // Stated, not only implied by the checks below (MEGA_AUDIT evm_01 I01, evm_02 L-3).
+        if (_minWithdrawalDelay > MAX_DELAY || _minAddressDelay > MAX_DELAY) revert InvalidParameter();
         _validate(Param.WithdrawalDelay, _withdrawalDelay);
         _validate(Param.AddressDelay, _addressDelay);
         _validate(Param.ConfirmationWindow, _confirmationWindow);
@@ -245,7 +254,12 @@ contract AvelockSecurityExtension is IExtension {
 
     function setAddressDelay(uint256 newValue) external onlyOwner whenUnlocked {
         if (newValue < minAddressDelay) revert BelowImmutableMinimum();
-        _proposeChange(Param.AddressDelay, newValue, addressDelay);
+        // Lowering it waits at least the delay in force (MEGA_AUDIT round2
+        // R2-M01): else a short policy delay made a new destination usable
+        // sooner than the address delay the owner set.
+        uint256 wait = changeWait();
+        if (newValue < addressDelay && addressDelay > wait) wait = addressDelay;
+        _proposeChangeWithWait(Param.AddressDelay, newValue, addressDelay, wait);
     }
 
     function setConfirmationWindow(uint256 newValue) external onlyOwner whenUnlocked {
@@ -267,6 +281,9 @@ contract AvelockSecurityExtension is IExtension {
         PendingParamChange storage p = pendingParamChanges[param];
         if (!p.exists) revert NoPendingChange();
         if (block.timestamp < p.effectiveAt) revert ChangeNotReady();
+        // A matured change is applied within a window, not years later in one
+        // block by whoever holds the phrase (MEGA_AUDIT round2 R2-L01).
+        if (block.timestamp > p.effectiveAt + APPLY_WINDOW) revert ChangeExpired();
 
         // Copy before the delete: `p` is a storage reference, so after it the
         // event would carry 0 instead of the applied value (AVL-EVM-001).
@@ -299,6 +316,10 @@ contract AvelockSecurityExtension is IExtension {
 
     /// @dev Every actual parameter change waits under the current policy, including increases.
     function _proposeChange(Param param, uint256 newValue, uint256 currentValue) internal {
+        _proposeChangeWithWait(param, newValue, currentValue, changeWait());
+    }
+
+    function _proposeChangeWithWait(Param param, uint256 newValue, uint256 currentValue, uint256 wait) internal {
         _validate(param, newValue);
         // Re-setting the current value withdraws any queued change for this
         // parameter, so an old pending weakening cannot survive it (audit M-1).
@@ -309,7 +330,7 @@ contract AvelockSecurityExtension is IExtension {
             }
             return;
         }
-        uint256 effectiveAt = block.timestamp + changeWait();
+        uint256 effectiveAt = block.timestamp + wait;
         pendingParamChanges[param] = PendingParamChange(newValue, effectiveAt, true);
         emit ParamChangeQueued(param, newValue, effectiveAt);
     }
@@ -352,6 +373,8 @@ contract AvelockSecurityExtension is IExtension {
 
     function addAllowedAddress(address destination) external onlyOwner whenUnlocked {
         if (destination == address(0)) revert ZeroAddress();
+        // Nothing sent to the vault itself or this module ever comes back (round2 R2-L04).
+        if (destination == walletAddress || destination == address(this)) revert InvalidParameter();
         if (allowlistActiveAt[destination] != 0) {
             // An entry voided by a lock may be added again (and waits again).
             if (!_voidedByLock(destination)) return;
@@ -438,6 +461,8 @@ contract AvelockSecurityExtension is IExtension {
         });
 
         emit WithdrawalRequested(requestId, to, token, amount, availableAt, expiresAt);
+        // A watcher sees what leaves without two more reads (round2 R2-L03).
+        if (kind != 0) emit NftWithdrawalRequested(requestId, kind, id);
     }
 
     /// @notice Cancel a pending request at any time before execution (owner or guard).
@@ -493,18 +518,20 @@ contract AvelockSecurityExtension is IExtension {
         uint256 heldBefore = kind == 2 ? _heldOf(r.token, walletAddress, tokenId[requestId]) : 0;
 
         emit WithdrawalExecuted(requestId);
-        bytes memory returndata = IAvelockWallet(walletAddress).executeFromExtension(callTarget, callValue, data);
+        IAvelockWallet(walletAddress).executeFromExtension(callTarget, callValue, data);
 
-        // Tokens signal the result three ways: revert, `false`, or nothing.
-        // Tether on TRON returns `false` even on success (audit H-5), so a
-        // `false`/empty return is accepted only when the Vault's balance
-        // actually dropped by the requested amount. `true` is trusted as-is.
+        // Tokens signal the result three ways: revert, `false`, or nothing,
+        // and some lie (Tether on TRON returns `false` on success, audit H-5;
+        // a broken token can return `true` without moving anything). So the
+        // return value is not trusted at all: the Vault's balance must have
+        // dropped by at least the requested amount (MEGA_AUDIT evm_01 L02).
+        // "At least": a token that charges its fee to the sender still works
+        // (MEGA_AUDIT evm_01 M02).
         if (isErc20) {
-            bool returnedTrue = returndata.length >= 32 && abi.decode(returndata, (bool));
-            if (!returnedTrue) {
-                uint256 balanceAfter = _tokenBalance(r.token, walletAddress);
-                if (balanceAfter > balanceBefore || balanceBefore - balanceAfter != r.amount) revert Erc20TransferFailed();
-            }
+            uint256 balanceAfter = _tokenBalance(r.token, walletAddress);
+            // Two wei of slack (MEGA_AUDIT round2 R2-L02): share-based tokens
+            // round a transfer and move `amount - 1` or `- 2` from the sender.
+            if (balanceAfter > balanceBefore || balanceBefore - balanceAfter + ROUNDING_SLACK < r.amount) revert Erc20TransferFailed();
         }
         // An NFT contract that returns without moving the token must not
         // leave the request marked done (audit A15-9).
@@ -560,13 +587,20 @@ contract AvelockSecurityExtension is IExtension {
 
     /// @notice True when a lock after its creation voided the request.
     function isRequestAnnulled(uint256 requestId) external view returns (bool) {
+        // A pruned id is not "annulled" (MEGA_AUDIT evm_04 I04).
+        if (requests[requestId].availableAt == 0) return false;
         return requestLockEpoch[requestId] != lockEpoch && !requests[requestId].executed;
     }
 
     // ---------------------------------------------------------------
     // Guard keys: stop-only second keys (old phone, hardware key).
-    // Adding and removing both wait addressDelay, so a stolen owner key
-    // cannot quietly swap them; a guard cannot cancel its own removal.
+    // Adding waits addressDelay. A guard still waiting can be dropped at
+    // once (owner, or a guard: so a thief's guard never arms). Removing an
+    // active guard waits changeWait() + lockDelay and goes ahead through a
+    // lock (MEGA_AUDIT evm_04 H01, L01): an honest guard still holds a phrase
+    // thief off for that long and more, but a stolen guard key can no longer
+    // keep the vault locked for good by re-locking. A guard cannot cancel
+    // its own removal.
     // ---------------------------------------------------------------
 
     function isGuard(address key) public view returns (bool) {
@@ -585,6 +619,8 @@ contract AvelockSecurityExtension is IExtension {
     function addGuard(address key) external onlyOwner whenUnlocked {
         if (key == address(0)) revert ZeroAddress();
         if (key == IAvelockWallet(walletAddress).owner()) revert InvalidParameter();
+        // Never the vault itself or this module (MEGA_AUDIT evm_04 I03).
+        if (key == walletAddress || key == address(this)) revert InvalidParameter();
         uint256 free = MAX_GUARDS;
         for (uint256 i; i < MAX_GUARDS; i++) {
             if (guardSlots[i].key == key) revert GuardExists();
@@ -609,10 +645,10 @@ contract AvelockSecurityExtension is IExtension {
             return;
         }
         if (!owner) revert NotOwner();
-        // Queued only while unlocked, and a lock drops the queue (audit A15-1).
-        if (locked) revert VaultLocked();
-        if (g.removableAt != 0) return;
-        uint256 removableAt = block.timestamp + addressDelay;
+        // Allowed during a lock and kept by later locks (MEGA_AUDIT evm_04 H01),
+        // so a rogue guard re-locking cannot make itself irremovable.
+        if (g.removableAt != 0) revert ChangeAlreadyPending();
+        uint256 removableAt = block.timestamp + changeWait() + lockDelay;
         g.removableAt = uint64(removableAt);
         emit GuardRemovalQueued(key, removableAt);
     }
@@ -624,14 +660,15 @@ contract AvelockSecurityExtension is IExtension {
         emit GuardRemovalCancelled(key);
     }
 
-    /// @dev Never during a lock (audit A15-1): otherwise a phrase thief queues
-    ///      the removal, waits out the guard's lock, and no one is left to
-    ///      extend it.
-    function finalizeGuardRemoval(address key) external onlyOwner whenUnlocked {
+    /// @dev Also during a lock (MEGA_AUDIT evm_04 H01). A phrase thief who
+    ///      queues it still waits changeWait() + lockDelay, then the lock, then
+    ///      the withdrawal delay; the owner sees the queued removal all along.
+    function finalizeGuardRemoval(address key) external onlyOwner {
         uint256 i = _guardIndex(key);
         uint256 removableAt = guardSlots[i].removableAt;
         if (removableAt == 0) revert NotPending();
         if (block.timestamp < removableAt) revert ChangeNotReady();
+        if (block.timestamp > removableAt + APPLY_WINDOW) revert ChangeExpired(); // round2 R2-L01
         delete guardSlots[i];
         emit GuardRemoved(key);
     }
@@ -668,13 +705,10 @@ contract AvelockSecurityExtension is IExtension {
         }
         for (uint256 i; i < MAX_GUARDS; i++) {
             Guard storage g = guardSlots[i];
+            // A queued removal of an active guard stays (MEGA_AUDIT evm_04 H01).
             if (g.key != address(0) && block.timestamp < g.activeAt) {
                 emit GuardRemoved(g.key);
                 delete guardSlots[i];
-            } else if (g.removableAt != 0) {
-                // A queued removal of an active guard is void too (A15-1).
-                g.removableAt = 0;
-                emit GuardRemovalCancelled(g.key);
             }
         }
         emit Locked(msg.sender, until);

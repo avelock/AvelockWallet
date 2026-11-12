@@ -6,19 +6,33 @@ import { pathToFileURL } from 'node:url';
 import { handle, limitKey, MAX_BODY } from './proxy.mjs';
 
 const PER_MINUTE = Number(process.env.RATE_PER_MINUTE || 120);
+/** Shared by every client of one route (round2 H-1). */
+const SHARED_PER_MINUTE = Number(process.env.SHARED_PER_MINUTE || 3000);
 
 // One minute of counts per client (IPv6 by /64); the table is dropped when
-// the minute changes, so it cannot grow without bound (A8-7).
+// the minute changes (A8-7) and holds at most MAX_KEYS within one (round2 L-8).
+const MAX_KEYS = 100_000;
 let minute = -1;
 let hits = new Map();
-function limited(ip) {
+let routeHits = new Map();
+function sharedLimited(route, weight) {
   const now = Math.floor(Date.now() / 60_000);
-  if (now !== minute) { minute = now; hits = new Map(); }
+  if (now !== minute) { minute = now; hits = new Map(); routeHits = new Map(); }
+  const n = (routeHits.get(route) ?? 0) + weight;
+  routeHits.set(route, n);
+  return n > SHARED_PER_MINUTE;
+}
+function limited(ip, weight = 1) {
+  const now = Math.floor(Date.now() / 60_000);
+  if (now !== minute) { minute = now; hits = new Map(); routeHits = new Map(); }
   const key = limitKey(ip);
-  const n = (hits.get(key) ?? 0) + 1;
+  if (!hits.has(key) && hits.size >= MAX_KEYS) return true;
+  const n = (hits.get(key) ?? 0) + weight;
   hits.set(key, n);
   return n > PER_MINUTE;
 }
+/** Largest answer passed on (round2 L-4): past it the connection is cut. */
+const MAX_ANSWER = 8 * 1024 * 1024;
 
 class BadRequest extends Error {}
 
@@ -33,8 +47,11 @@ export async function nodeHandler(req, res, env = process.env) {
   };
   try {
     if (req.method !== 'GET' && req.method !== 'POST') throw new BadRequest();
-    // nginx passes the client address; only it can reach this port.
-    const ip = String(req.headers['x-real-ip'] || req.socket.remoteAddress);
+    // nginx passes the client address; the header is believed only from a
+    // loopback peer, which is nginx (round2 L-7).
+    const peer = String(req.socket.remoteAddress ?? '');
+    const loopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+    const ip = loopback && typeof req.headers['x-real-ip'] === 'string' ? req.headers['x-real-ip'] : peer;
     if (limited(ip)) return reply(429, { 'Retry-After': '60' });
     const chunks = [];
     let size = 0;
@@ -52,10 +69,17 @@ export async function nodeHandler(req, res, env = process.env) {
       headers: { 'content-type': req.headers['content-type'] || '' },
       body: req.method === 'POST' ? Buffer.concat(chunks) : undefined,
     });
-    const response = await handle(request, env);
-    const body = Buffer.from(await response.arrayBuffer());
+    const response = await handle(request, env, fetch, async n => !limited(ip, n), async (route, w) => !sharedLimited(route, w));
+    // Streamed with a byte count (round2 L-4): a huge answer is cut, not held in memory.
     res.writeHead(response.status, Object.fromEntries(response.headers));
-    res.end(body);
+    if (!response.body) return void res.end();
+    let sent = 0;
+    for await (const chunk of response.body) {
+      sent += chunk.byteLength;
+      if (sent > MAX_ANSWER) return void res.destroy();
+      if (!res.write(chunk)) await new Promise(r => res.once('drain', r));
+    }
+    res.end();
   } catch (e) {
     reply(e instanceof BadRequest ? 400 : 502);
   }

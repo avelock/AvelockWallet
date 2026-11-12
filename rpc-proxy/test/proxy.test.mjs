@@ -50,8 +50,8 @@ test('REST routes keep path and query, only allowed paths', async () => {
   const u = upstream();
   assert.equal((await handle(get('/ton/testnet/api/v3/nft/items?owner_address=abc&limit=5'), {}, u.fn)).status, 200);
   assert.equal(u.calls[0].url, 'https://testnet.toncenter.com/api/v3/nft/items?owner_address=abc&limit=5');
-  assert.equal((await handle(get('/btc/signet/address/tb1qxyz/utxo'), {}, u.fn)).status, 200);
-  assert.equal(u.calls[1].url, 'https://mempool.space/signet/api/address/tb1qxyz/utxo');
+  assert.equal((await handle(get('/btc/signet/address/tb1qxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyz/utxo'), {}, u.fn)).status, 200);
+  assert.equal(u.calls[1].url, 'https://mempool.space/signet/api/address/tb1qxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyz/utxo');
   assert.equal((await handle(post('/btc/signet/tx', '0200'), {}, u.fn)).status, 200);
   assert.equal((await handle(post('/btc/signet/address/x', '{}'), {}, u.fn)).status, 403);
   assert.equal((await handle(post('/tron/nile/wallet/../admin', '{}'), {}, u.fn)).status, 403);
@@ -122,6 +122,14 @@ test('event scans go to the public node, other calls to the configured provider'
   assert.equal(u.calls[1].url, 'https://paid.example/key');
 });
 
+test('the route follows the parsed method, not text inside a parameter', async () => {
+  const u = upstream();
+  const env = { EVM_ETH_URL: 'https://paid.example/key' };
+  // A call whose data merely contains the text of a public-node method.
+  await handle(post('/evm/eth', { jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ data: '"method":"eth_getLogs"' }] }), env, u.fn);
+  assert.equal(u.calls[0].url, 'https://paid.example/key');
+});
+
 test('Solana getProgramAccounts goes to the public devnet node, other methods to the keyed one', async () => {
   const seen = [];
   const fetchUp = async (url) => { seen.push(url); return new Response('{}', { status: 200 }); };
@@ -131,4 +139,92 @@ test('Solana getProgramAccounts goes to the public devnet node, other methods to
   await call('getBalance');
   assert.equal(seen[0], 'https://solana-devnet.api.onfinality.io/public');
   assert.equal(seen[1], 'https://keyed.example/abc');
+});
+
+
+test('round2 M-1: the upstream gets a rebuilt body, never duplicate or differently cased keys', async () => {
+  const u = upstream();
+  const raw = '{"jsonrpc":"2.0","id":1,"method":"eth_call","Method":"debug_traceBlockByNumber","params":[],"x":1}';
+  const res = await handle(new Request('https://rpc.avelock.app/evm/eth', { method: 'POST', body: raw, headers: { 'content-type': 'application/json' } }), {}, u.fn);
+  assert.equal(res.status, 200);
+  assert.equal(u.calls[0].init.body, '{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[]}');
+  const bad = await handle(new Request('https://rpc.avelock.app/evm/eth', { method: 'POST', body: '{"method":{"toString":1}}' }), {}, u.fn);
+  assert.equal(bad.status, 403);
+});
+
+test('round2 M-3: requests from a web page are refused', async () => {
+  const u = upstream();
+  const res = await handle(new Request('https://rpc.avelock.app/evm/eth', { method: 'POST', body: '{"method":"eth_chainId"}', headers: { origin: 'https://evil.example' } }), {}, u.fn);
+  assert.equal(res.status, 403);
+  assert.equal(u.calls.length, 0);
+});
+
+test('round2 M-4: only the indexer and Esplora paths the app uses; unknown query keys dropped', async () => {
+  const u = upstream();
+  assert.equal((await handle(get('/ton/testnet/api/v3/actions'), {}, u.fn)).status, 403);
+  assert.equal((await handle(get('/btc/signet/v1/mining/pools/3y'), {}, u.fn)).status, 403);
+  assert.equal((await handle(get('/ton/testnet/api/v3/transactions?account=abc&limit=10&api_key=x'), {}, u.fn)).status, 200);
+  assert.equal(u.calls[0].url, 'https://testnet.toncenter.com/api/v3/transactions?account=abc&limit=10');
+});
+
+test('round2 H-1: a batch is charged one unit per call', async () => {
+  const u = upstream();
+  let charged = 0;
+  const batch = Array.from({ length: 5 }, (_, i) => ({ jsonrpc: '2.0', id: i, method: 'eth_chainId' }));
+  await handle(new Request('https://rpc.avelock.app/evm/eth', { method: 'POST', body: JSON.stringify(batch) }), {}, u.fn, async n => { charged += n; return true; });
+  assert.equal(charged, 4);
+  const refused = await handle(new Request('https://rpc.avelock.app/evm/eth', { method: 'POST', body: JSON.stringify(batch) }), {}, u.fn, async () => false);
+  assert.equal(refused.status, 429);
+});
+
+test('round2 L-1: address keys', () => {
+  assert.equal(limitKey('::ffff:1.2.3.4'), '1.2.3.4');
+  assert.notEqual(limitKey('::ffff:1.2.3.4'), limitKey('::ffff:9.9.9.9'));
+  assert.equal(limitKey('2001:db8::1:2:3:4:5'), '2001:db8:0:1::/64');
+  assert.equal(limitKey('2001:0db8:1:2::1'), limitKey('2001:db8:1:2::1'));
+  assert.equal(limitKey('1.2.3.4, 5.6.7.8'), 'unknown');
+});
+
+test('round2 L-10: an error page that repeats a key is not passed on', async () => {
+  const fn = async () => new Response('invalid key SECRETKEY123', { status: 401 });
+  const res = await handle(get('/ton/testnet/api/v3/nft/items'), { TONCENTER_KEY: 'SECRETKEY123' }, fn);
+  assert.equal(res.status, 401);
+  assert.ok(!(await res.text()).includes('SECRETKEY123'));
+});
+
+test('round2 H-1: heavy calls weigh more; a shared route budget refuses reads but never sends', async () => {
+  const { callWeight, HEAVY_WEIGHT } = await import('../src/proxy.mjs');
+  assert.equal(callWeight([{ method: 'eth_call' }, { method: 'eth_getLogs' }]), 1 + HEAVY_WEIGHT);
+  const u = upstream();
+  const spent = [];
+  const shared = async (route, w) => { spent.push([route, w]); return false; };
+  const read = await handle(post('/evm/eth', { jsonrpc: '2.0', id: 1, method: 'eth_call', params: [] }), {}, u.fn, async () => true, shared);
+  assert.equal(read.status, 429);
+  const send = await handle(post('/evm/eth', { jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: ['0x00'] }), {}, u.fn, async () => true, shared);
+  assert.equal(send.status, 200);
+  assert.deepEqual(spent, [['/evm/eth', 1]]);
+});
+
+test('round2 L-3: a body slower than its deadline is a clean 504, not a cut-off 200', async () => {
+  const proxy = await import('../src/proxy.mjs');
+  const slow = async (_url, init) => new Response(new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode('{"result":')); init.signal.addEventListener('abort', () => c.error(new Error('aborted'))); },
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+  const t0 = Date.now();
+  const origTimeout = global.setTimeout;
+  // Speed up: run the body deadline at once.
+  global.setTimeout = (fn, ms) => origTimeout(fn, ms === proxy.BODY_TIMEOUT_MS ? 10 : ms);
+  try {
+    const res = await handle(post('/evm/eth', { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber' }), {}, slow);
+    assert.equal(res.status, 504);
+  } finally {
+    global.setTimeout = origTimeout;
+  }
+  assert.ok(Date.now() - t0 < 5000);
+});
+
+test('a TRON send is the path the app uses (REVIEW_last3days)', async () => {
+  const { isSend } = await import('../src/proxy.mjs');
+  assert.equal(isSend(undefined, 'POST', '/wallet/broadcasthex'), true);
+  assert.equal(isSend(undefined, 'POST', '/wallet/getaccount'), false);
 });
